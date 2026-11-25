@@ -1,0 +1,128 @@
+package org.opentripplanner.street.graph.summary;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.stream.Stream;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.street.graph.Graph;
+import org.opentripplanner.street.model.edge.AreaEdge;
+import org.opentripplanner.street.model.edge.Edge;
+import org.opentripplanner.street.model.edge.StreetEdge;
+import org.opentripplanner.street.model.edge.TemporaryEdge;
+import org.opentripplanner.street.model.edge.TemporaryPartialStreetEdge;
+import org.opentripplanner.street.model.vertex.SplitterVertex;
+import org.opentripplanner.street.model.vertex.TransitStopVertex;
+import org.opentripplanner.street.model.vertex.Vertex;
+import org.opentripplanner.street.model.vertex.VertexLabel;
+import org.opentripplanner.utils.collection.ListUtils;
+import org.opentripplanner.utils.collection.StreamUtils;
+
+/// A class for converting graph entities into human-readable strings, which help writing assertions
+/// in test. It does not create or manipulate any entities - it is purely read-only.
+///
+/// This is in the production code, so it can be used in tests across modules. While it is a code
+/// smell, it's less bad than the other options.
+public class GraphSummarizer {
+
+  private final Graph graph;
+
+  public GraphSummarizer(Graph graph) {
+    this.graph = graph;
+  }
+
+  /// Converts the input to a string-based label and looks it up in the graph. Remember that there
+  /// are other, non-string vertex labels for which this method will not work.
+  ///
+  /// @see VertexLabel
+  @Nullable
+  public Vertex getVertex(String label) {
+    return graph.getVertex(VertexLabel.string(label));
+  }
+
+  public List<StreetEdge> listStreetEdges() {
+    return listEdges()
+      .stream()
+      .filter(StreetEdge.class::isInstance)
+      .map(StreetEdge.class::cast)
+      .toList();
+  }
+
+  public List<TransitStopVertex> listStopVertices() {
+    return ListUtils.ofIterable(graph.findVertices(TransitStopVertex.class));
+  }
+
+  /// Iterates over all vertices in the graph and gets all incoming _and_ outgoing edges. This is a
+  /// different behavior than {@link Graph#listEdges()}, which only returns edges that are outgoing.
+  ///
+  /// This is needed so that temporary link edges, whose from-vertex is not added to the graph's
+  /// collection of vertices, are included in the summary and can then be asserted against.
+  public List<Edge> listEdges() {
+    return distinctEdges().toList();
+  }
+
+  public List<AreaEdge> listAreaEdges() {
+    return findEdges(AreaEdge.class);
+  }
+
+  /**
+   * Return all edges of a certain type in the graph.
+   */
+  public <T extends Edge> List<T> findEdges(Class<T> cls) {
+    return distinctEdges().filter(cls::isInstance).map(cls::cast).toList();
+  }
+
+  /// The vertices reachable from `vertex` in one hop, in edge order. Duplicates are kept, so two
+  /// parallel edges to the same target show up twice.
+  public static List<Vertex> successors(Vertex vertex) {
+    return vertex.getOutgoing().stream().map(Edge::getToVertex).toList();
+  }
+
+  /// The area edges leading out of a single vertex, as opposed to {@link #listAreaEdges()} over the
+  /// whole graph. Useful for asserting how well a vertex is wired into the area around it.
+  public static List<AreaEdge> outgoingAreaEdges(Vertex vertex) {
+    return vertex
+      .getOutgoing()
+      .stream()
+      .filter(AreaEdge.class::isInstance)
+      .map(AreaEdge.class::cast)
+      .toList();
+  }
+
+  public String geoJsonUrl() {
+    return GeoJsonIo.toUrl(this.listEdges(), graph.getVertices());
+  }
+
+  public Collection<String> summarizeSplitVertices() {
+    var vertices = graph.findVertices(SplitterVertex.class);
+    return StreamUtils.ofIterable(vertices).map(StreetSummarizer::summarizeVertex).toList();
+  }
+
+  public Collection<String> summarizeEdges() {
+    return listEdges().stream().map(StreetSummarizer::summarizeEdge).toList();
+  }
+
+  /**
+   * A list of textual representations of the links (edges of type
+   * {@link TemporaryPartialStreetEdge}) in the graph.
+   */
+  public Collection<String> summarizeTempEdges() {
+    return listEdges()
+      .stream()
+      .filter(e -> e instanceof TemporaryEdge)
+      .map(StreetSummarizer::summarizeEdge)
+      .toList();
+  }
+
+  public Graph graph() {
+    return graph;
+  }
+
+  /// See [GraphSummarizer#listEdges()] on why both incoming and outgoing edges are returned.
+  private Stream<Edge> distinctEdges() {
+    return graph
+      .getVertices()
+      .stream()
+      .flatMap(v -> Stream.concat(v.getOutgoing().stream(), v.getIncoming().stream()))
+      .distinct();
+  }
+}

@@ -1,0 +1,295 @@
+package org.opentripplanner.netex.mapping;
+
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import java.math.BigInteger;
+import java.time.LocalTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import org.entur.netex2.model.AllPublicTransportModesEnumeration;
+import org.entur.netex2.model.JourneyPattern;
+import org.entur.netex2.model.JourneyPatternRefStructure;
+import org.entur.netex2.model.Line;
+import org.entur.netex2.model.LineRefStructure;
+import org.entur.netex2.model.MultilingualString;
+import org.entur.netex2.model.Notice;
+import org.entur.netex2.model.NoticeAssignment;
+import org.entur.netex2.model.PointInLinkSequence_VersionedChildStructure;
+import org.entur.netex2.model.PointsInJourneyPattern_RelStructure;
+import org.entur.netex2.model.Quay;
+import org.entur.netex2.model.Route;
+import org.entur.netex2.model.RouteRefStructure;
+import org.entur.netex2.model.ScheduledStopPointRefStructure;
+import org.entur.netex2.model.ServiceJourney;
+import org.entur.netex2.model.StopPointInJourneyPattern;
+import org.entur.netex2.model.StopPointInJourneyPatternRefStructure;
+import org.entur.netex2.model.TimetabledPassingTime;
+import org.entur.netex2.model.TimetabledPassingTimes_RelStructure;
+import org.entur.netex2.model.VersionOfObjectRefStructure;
+import org.junit.jupiter.api.Test;
+import org.opentripplanner.core.model.id.FeedScopedId;
+import org.opentripplanner.graph_builder.issue.api.DataImportIssue;
+import org.opentripplanner.graph_builder.issue.service.DefaultDataImportIssueStore;
+import org.opentripplanner.model.TransitDataImport;
+import org.opentripplanner.model.impl.TransitDataImportBuilder;
+import org.opentripplanner.netex.index.NetexEntityIndex;
+import org.opentripplanner.transit.dataimport.TimetableDataImport;
+import org.opentripplanner.transit.model.framework.Deduplicator;
+import org.opentripplanner.transit.model.site.RegularStop;
+import org.opentripplanner.transit.service.SiteRepository;
+
+class NetexMapperTest {
+
+  private static final String QUAY_ID = "quay-1";
+  private static final String SSP_ID = "ssp-1";
+  private static final String FEED_ID = "sta";
+  private static final RegularStop STOP = stop(QUAY_ID);
+  private static final Deduplicator DEDUPLICATOR = new Deduplicator();
+  private static final String TIMETABLED_PASSING_TIME_ID = "TTPT-1";
+
+  @Test
+  void sspWithAssignment() {
+    var issueStore = new DefaultDataImportIssueStore();
+    var transitBuilder = new TransitDataImportBuilder(SiteRepository.of().build(), issueStore);
+    transitBuilder.siteRepository().withRegularStop(STOP);
+
+    var netexMapper = new NetexMapper(
+      transitBuilder,
+      FEED_ID,
+      DEDUPLICATOR,
+      issueStore,
+      Set.of(),
+      Set.of(),
+      10,
+      0.0,
+      false
+    );
+
+    var index = new NetexEntityIndex();
+    index.quayById.add(new Quay().withId(QUAY_ID));
+    index.quayIdByStopPointRef.add(SSP_ID, QUAY_ID);
+    netexMapper.mapNetexToOtp(index.readOnlyView());
+
+    assertEquals(
+      STOP,
+      transitBuilder.stopsByScheduledStopPoints().get(new FeedScopedId(FEED_ID, SSP_ID))
+    );
+  }
+
+  @Test
+  void sspPointsToUnknownId() {
+    var issueStore = new DefaultDataImportIssueStore();
+
+    var netexMapper = new NetexMapper(
+      new TransitDataImportBuilder(SiteRepository.of().build(), issueStore),
+      FEED_ID,
+      DEDUPLICATOR,
+      issueStore,
+      Set.of(),
+      Set.of(),
+      10,
+      0.0,
+      false
+    );
+
+    var index = new NetexEntityIndex();
+    index.quayById.add(new Quay().withId(QUAY_ID));
+    index.quayIdByStopPointRef.add(SSP_ID, QUAY_ID);
+    netexMapper.mapNetexToOtp(index.readOnlyView());
+
+    var issueTypes = issueStore.listIssues().stream().map(DataImportIssue::getType).toList();
+
+    assertThat(issueTypes).contains("ScheduledStopPointAssignedToUnknownQuay");
+  }
+
+  /**
+   * {@link org.opentripplanner.netex.mapping.support.NetexMapperIndexes#getStopTimesByNetexId()} is
+   * documented to be scoped per hierarchy level (shared files, shared-group files, group files) and
+   * thrown away once that level is popped.
+   */
+  @Test
+  void noticeAssignmentIsNotResolvedAcrossSiblingFiles() {
+    var issueStore = new DefaultDataImportIssueStore();
+    var transitBuilder = new TransitDataImportBuilder(SiteRepository.of().build(), issueStore);
+    transitBuilder.siteRepository().withRegularStop(stop("quay-1"));
+    transitBuilder.siteRepository().withRegularStop(stop("quay-2"));
+
+    var netexMapper = new NetexMapper(
+      transitBuilder,
+      FEED_ID,
+      DEDUPLICATOR,
+      issueStore,
+      Set.of(),
+      Set.of(),
+      10,
+      0.0,
+      false
+    );
+
+    // Level 0 ("shared data"): empty, but it is the common ancestor for both group files below.
+    netexMapper.mapNetexToOtp(new NetexEntityIndex().readOnlyView());
+
+    // Level 1 ("group"), file A: maps a ServiceJourney with a TimetabledPassingTime whose id is
+    // TIMETABLED_PASSING_TIME_ID.
+    netexMapper.push();
+    netexMapper.mapNetexToOtp(fileWithServiceJourney().readOnlyView());
+    netexMapper.pop();
+
+    // Level 1, file B: a sibling of file A (not a descendant of it), whose NoticeAssignment
+    // refers to the TimetabledPassingTime mapped while processing file A.
+    netexMapper.push();
+    netexMapper.mapNetexToOtp(fileWithNoticeAssignment(TIMETABLED_PASSING_TIME_ID).readOnlyView());
+    netexMapper.pop();
+
+    // If file A's StopTime had leaked into file B's lookup (the bug this guards against), the
+    // NoticeAssignment would have resolved successfully and none of these issues would be raised.
+    var issueTypes = issueStore.listIssues().stream().map(DataImportIssue::getType).toList();
+    assertThat(issueTypes).contains("NoticeAssignmentWithUnknownEntity");
+  }
+
+  /**
+   * Each NeTEx feed is mapped by its own {@link NetexMapper}, and the service ids of all feeds are
+   * registered in the same {@link TimetableDataImport}. A trip without operating days gets the
+   * empty service id, so that id must be unique per feed.
+   */
+  @Test
+  void tripsWithoutOperatingDaysInTwoFeeds() {
+    var feedA = mapFeedWithTripWithoutOperatingDays("A");
+    var feedB = mapFeedWithTripWithoutOperatingDays("B");
+
+    // Registering the service ids of both feeds must not fail on a duplicate id
+    var timetableDataImport = new TimetableDataImport();
+    timetableDataImport.addNextServiceCodes(feedA.getAllServiceIds());
+    timetableDataImport.addNextServiceCodes(feedB.getAllServiceIds());
+
+    var serviceIdA = feedA.getAllTrips().iterator().next().getServiceId();
+    var serviceIdB = feedB.getAllTrips().iterator().next().getServiceId();
+    assertEquals(new FeedScopedId("CAL-SERVICE", "A:EMPTY"), serviceIdA);
+    assertEquals(new FeedScopedId("CAL-SERVICE", "B:EMPTY"), serviceIdB);
+    assertThat(timetableDataImport.getServiceCodes()).containsExactly(serviceIdA, 0, serviceIdB, 1);
+  }
+
+  private static TransitDataImport mapFeedWithTripWithoutOperatingDays(String feedId) {
+    var issueStore = new DefaultDataImportIssueStore();
+    var transitBuilder = new TransitDataImportBuilder(SiteRepository.of().build(), issueStore);
+    var siteRepository = transitBuilder.siteRepository();
+    for (var quayId : List.of("quay-1", "quay-2")) {
+      siteRepository.withRegularStop(
+        siteRepository
+          .regularStop(new FeedScopedId(feedId, quayId))
+          .withCoordinate(60.0, 10.0)
+          .build()
+      );
+    }
+
+    var netexMapper = new NetexMapper(
+      transitBuilder,
+      feedId,
+      DEDUPLICATOR,
+      issueStore,
+      Set.of(),
+      Set.of(),
+      10,
+      0.0,
+      false
+    );
+    netexMapper.mapNetexToOtp(new NetexEntityIndex().readOnlyView());
+    netexMapper.push();
+    // The ServiceJourney has no DayTypes, so it does not operate on any day
+    netexMapper.mapNetexToOtp(fileWithServiceJourney().readOnlyView());
+    netexMapper.pop();
+    netexMapper.finishUp();
+
+    return transitBuilder.build();
+  }
+
+  private static RegularStop stop(String quayId) {
+    return RegularStop.of(new FeedScopedId(FEED_ID, quayId), () -> 1)
+      .withCoordinate(60.0, 10.0)
+      .build();
+  }
+
+  private static NetexEntityIndex fileWithServiceJourney() {
+    var index = new NetexEntityIndex();
+    index.timeZone.set("Europe/Oslo");
+
+    Line line = new Line()
+      .withId("RUT:Line:1")
+      .withName(new MultilingualString().withContent("Line 1"))
+      .withTransportMode(AllPublicTransportModesEnumeration.BUS);
+    index.lineById.add(line);
+
+    var lineRef = MappingSupport.createWrappedRef(line.getId(), LineRefStructure.class);
+    index.routeById.add(new Route().withId("RUT:Route:1").withLineRef(lineRef));
+    var routeRef = new RouteRefStructure().withRef("RUT:Route:1");
+
+    List<PointInLinkSequence_VersionedChildStructure> points = new ArrayList<>();
+    List<TimetabledPassingTime> passingTimes = new ArrayList<>();
+    String[] quayIds = { "quay-1", "quay-2" };
+    String[] passingTimeIds = { TIMETABLED_PASSING_TIME_ID, "TTPT-2" };
+
+    for (int i = 0; i < quayIds.length; i++) {
+      String stopPointId = "RUT:StopPointInJourneyPattern:" + (i + 1);
+      points.add(
+        new StopPointInJourneyPattern()
+          .withId(stopPointId)
+          .withOrder(BigInteger.valueOf(i + 1))
+          .withScheduledStopPointRef(
+            MappingSupport.createWrappedRef(stopPointId, ScheduledStopPointRefStructure.class)
+          )
+      );
+      passingTimes.add(
+        new TimetabledPassingTime()
+          .withId(passingTimeIds[i])
+          .withDepartureTime(LocalTime.of(8, i))
+          .withPointInJourneyPatternRef(
+            MappingSupport.createWrappedRef(
+              stopPointId,
+              StopPointInJourneyPatternRefStructure.class
+            )
+          )
+      );
+      index.quayIdByStopPointRef.add(stopPointId, quayIds[i]);
+    }
+
+    var journeyPattern = new JourneyPattern()
+      .withId("RUT:JourneyPattern:1")
+      .withRouteRef(routeRef)
+      .withPointsInSequence(
+        new PointsInJourneyPattern_RelStructure().withPointInJourneyPatternOrStopPointInJourneyPatternOrTimingPointInJourneyPattern(
+          points
+        )
+      );
+    index.journeyPatternsById.add(journeyPattern);
+
+    var serviceJourney = new ServiceJourney()
+      .withId("RUT:ServiceJourney:1")
+      .withLineRef(lineRef)
+      .withJourneyPatternRef(
+        MappingSupport.createWrappedRef(journeyPattern.getId(), JourneyPatternRefStructure.class)
+      )
+      .withPassingTimes(
+        new TimetabledPassingTimes_RelStructure().withTimetabledPassingTime(passingTimes)
+      );
+    index.serviceJourneyById.add(serviceJourney);
+
+    return index;
+  }
+
+  private static NetexEntityIndex fileWithNoticeAssignment(String noticedObjectId) {
+    var index = new NetexEntityIndex();
+    var notice = new Notice()
+      .withId("RUT:Notice:1")
+      .withText(new MultilingualString().withContent("Notice text"));
+
+    var noticeAssignment = new NoticeAssignment()
+      .withId("RUT:NoticeAssignment:1")
+      .withNoticedObjectRef(new VersionOfObjectRefStructure().withRef(noticedObjectId))
+      .withNotice(notice);
+    index.noticeAssignmentById.add(noticeAssignment);
+
+    return index;
+  }
+}

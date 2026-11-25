@@ -1,0 +1,157 @@
+package org.opentripplanner.routing.algorithm.raptoradapter.transit;
+
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.transfer.constrained.ConstrainedTransferService;
+import org.opentripplanner.transfer.constrained.raptoradaptor.ConstrainedTransfersForPatterns;
+import org.opentripplanner.transfer.constrained.raptoradaptor.TransferIndexGenerator;
+import org.opentripplanner.transit.model.site.StopLocation;
+import org.opentripplanner.transit.service.SiteRepository;
+
+/**
+ * This is a replica of public transportation data already present in TransitRepository, but
+ * rearranged and indexed differently for efficient use by the Raptor router. Patterns and trips are
+ * split out by days, retaining only the services actually running on any particular day.
+ *
+ */
+public class RaptorTransitData {
+
+  /**
+   * Transit data required for routing, indexed by each local date(Graph TimeZone) it runs through.
+   * A Trip "runs through" a date if any of its arrivals or departures is happening on that date.
+   * The same trip pattern can therefore have multiple running dates and trip pattern is not
+   * required to "run" on its service date.
+   */
+  private final HashMap<LocalDate, List<TripPatternForDate>> tripPatternsRunningOnDate;
+
+  /**
+   * Trip to trip transfers like with properties like guaranteedTransfer, staySeated and priority.
+   */
+  private final ConstrainedTransferService transferService;
+
+  private final SiteRepository siteRepository;
+
+  private ConstrainedTransfersForPatterns constrainedTransfers;
+
+  private final TransferIndexGenerator transferIndexGenerator;
+
+  private final int @Nullable [] stopBoardAlightTransferCosts;
+
+  /**
+   * Makes a shallow copy of the RaptorTransitData, except for the tripPatternsForDate, where a
+   * shallow copy of the HashMap is made. This is sufficient, as the
+   * RealTimeRaptorTransitDataUpdater will replace entire keys and their values in the map.
+   */
+  public RaptorTransitData(RaptorTransitData raptorTransitData) {
+    this(
+      raptorTransitData.tripPatternsRunningOnDate,
+      raptorTransitData.transferService,
+      raptorTransitData.siteRepository,
+      raptorTransitData.constrainedTransfers,
+      raptorTransitData.transferIndexGenerator,
+      raptorTransitData.stopBoardAlightTransferCosts
+    );
+  }
+
+  public RaptorTransitData(
+    Map<LocalDate, List<TripPatternForDate>> tripPatternsRunningOnDate,
+    ConstrainedTransferService transferService,
+    SiteRepository siteRepository,
+    ConstrainedTransfersForPatterns constrainedTransfers,
+    TransferIndexGenerator transferIndexGenerator,
+    int @Nullable [] stopBoardAlightTransferCosts
+  ) {
+    this.tripPatternsRunningOnDate = new HashMap<>(tripPatternsRunningOnDate);
+    this.transferService = transferService;
+    this.siteRepository = siteRepository;
+    this.constrainedTransfers = constrainedTransfers;
+    this.transferIndexGenerator = transferIndexGenerator;
+    this.stopBoardAlightTransferCosts = stopBoardAlightTransferCosts;
+  }
+
+  @Nullable
+  public StopLocation getStopByIndex(int stop) {
+    return stop == -1 ? null : this.siteRepository.stopByIndex(stop);
+  }
+
+  /**
+   * Returns trip patterns for the given running date. Running date is not necessarily the same as
+   * the service date. A Trip "runs through" a date if any of its arrivals or departures is
+   * happening on that date. Trip pattern can have multiple running dates.
+   */
+  public Collection<TripPatternForDate> getTripPatternsForRunningDate(LocalDate date) {
+    return tripPatternsRunningOnDate.getOrDefault(date, List.of());
+  }
+
+  public int getStopCount() {
+    return siteRepository.stopIndexSize();
+  }
+
+  /**
+   * Returns a copy of the list of trip patterns for the given running date. Running date is not
+   * necessarily the same as the service date. A Trip "runs through" a date if any of its arrivals
+   * or departures is happening on that date. Trip pattern can have multiple running dates.
+   */
+  public List<TripPatternForDate> getTripPatternsRunningOnDateCopy(LocalDate runningPeriodDate) {
+    List<TripPatternForDate> tripPatternForDate = tripPatternsRunningOnDate.get(runningPeriodDate);
+    return tripPatternForDate != null ? new ArrayList<>(tripPatternForDate) : new ArrayList<>();
+  }
+
+  /**
+   * Returns a copy of the list of trip patterns for the given service date. Service date is not
+   * necessarily the same as any of the trip pattern's running dates.
+   */
+  public List<TripPatternForDate> getTripPatternsOnServiceDateCopy(LocalDate date) {
+    List<TripPatternForDate> tripPatternsRunningOnDates = getTripPatternsRunningOnDateCopy(date);
+    // Trip pattern can run only after midnight. Therefore, we need to get the trip pattern's for
+    // the next running date as well and filter out duplicates.
+    tripPatternsRunningOnDates.addAll(getTripPatternsRunningOnDateCopy(date.plusDays(1)));
+    return tripPatternsRunningOnDates
+      .stream()
+      .filter(t -> t.getServiceDate().equals(date))
+      .distinct()
+      .collect(Collectors.toList());
+  }
+
+  public ConstrainedTransferService getTransferService() {
+    return transferService;
+  }
+
+  @Nullable
+  public ConstrainedTransfersForPatterns getConstrainedTransfers() {
+    return constrainedTransfers;
+  }
+
+  public TransferIndexGenerator getTransferIndexGenerator() {
+    return transferIndexGenerator;
+  }
+
+  /**
+   * Costs for both boarding and alighting at a given stop during transfer. Note that this is in
+   * raptor centi-second units.
+   */
+  public int @Nullable [] getStopBoardAlightTransferCosts() {
+    return stopBoardAlightTransferCosts;
+  }
+
+  /**
+   * Replaces all the TripPatternForDates for a single date. This is an atomic operation according
+   * to the HashMap implementation.
+   */
+  public void replaceTripPatternsForDate(
+    LocalDate date,
+    List<TripPatternForDate> tripPatternForDates
+  ) {
+    this.tripPatternsRunningOnDate.replace(date, tripPatternForDates);
+  }
+
+  public void setConstrainedTransfers(ConstrainedTransfersForPatterns constrainedTransfers) {
+    this.constrainedTransfers = constrainedTransfers;
+  }
+}

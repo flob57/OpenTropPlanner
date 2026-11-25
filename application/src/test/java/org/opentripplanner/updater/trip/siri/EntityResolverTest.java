@@ -1,0 +1,141 @@
+package org.opentripplanner.updater.trip.siri;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.Map;
+import java.util.function.UnaryOperator;
+import org.junit.jupiter.api.Test;
+import org.opentripplanner.LocalTimeParser;
+import org.opentripplanner.core.model.id.FeedScopedId;
+import org.opentripplanner.routing.algorithm.raptoradapter.transit.RaptorTransitDataTestFactory;
+import org.opentripplanner.transit.dataimport.TimetableDataImport;
+import org.opentripplanner.transit.model._data.TransitRepositoryForTest;
+import org.opentripplanner.transit.model.organization.Operator;
+import org.opentripplanner.transit.model.site.RegularStop;
+import org.opentripplanner.transit.repository.DefaultTimetableRepository;
+import org.opentripplanner.transit.service.SiteRepository;
+import org.opentripplanner.transit.service.TransitRepository;
+
+class EntityResolverTest {
+
+  private static final TransitRepositoryForTest TEST_MODEL = TransitRepositoryForTest.of();
+  private static final RegularStop STOP_1 = TEST_MODEL.stop("stop-1").build();
+  private static final RegularStop STOP_2 = TEST_MODEL.stop("stop-2").build();
+  private static final SiteRepository SITE_REPOSITORY = TEST_MODEL.siteRepositoryBuilder()
+    .withRegularStops(List.of(STOP_1, STOP_2))
+    .build();
+  private static final String FEED_ID = STOP_1.getId().getFeedId();
+  private static final FeedScopedId SSP_ID = new FeedScopedId(FEED_ID, "ssp-1");
+  private static final Operator OPERATOR = Operator.of(new FeedScopedId(FEED_ID, "operator-1"))
+    .withName("Operator 1")
+    .build();
+
+  @Test
+  void resolveScheduledStopPointId() {
+    var transitRepository = new TransitRepository();
+    transitRepository.addScheduledStopPointMapping(Map.of(SSP_ID, STOP_1));
+    var resolver = newResolver(transitRepository);
+    var stop = resolver.resolveQuay(SSP_ID.getId());
+    assertEquals(STOP_1, stop);
+  }
+
+  @Test
+  void resolveQuayId() {
+    var transitRepository = new TransitRepository(SITE_REPOSITORY);
+    var resolver = newResolver(transitRepository);
+    var stop = resolver.resolveQuay(STOP_1.getId().getId());
+    assertEquals(STOP_1, stop);
+  }
+
+  @Test
+  void scheduledStopPointTakesPrecedence() {
+    var transitRepository = new TransitRepository(SITE_REPOSITORY);
+    transitRepository.addScheduledStopPointMapping(Map.of(SSP_ID, STOP_2));
+    var resolver = newResolver(transitRepository);
+    assertEquals(STOP_2, resolver.resolveQuay(SSP_ID.getId()));
+    assertEquals(STOP_1, resolver.resolveQuay(STOP_1.getId().getId()));
+  }
+
+  @Test
+  void resolveOperator() {
+    var transitRepository = new TransitRepository();
+    transitRepository.addOperators(List.of(OPERATOR));
+    transitRepository.index();
+    var resolver = newResolver(transitRepository);
+
+    assertEquals(OPERATOR, resolver.resolveOperator(OPERATOR.getId().getId()));
+    assertNull(resolver.resolveOperator("unknown-operator"));
+  }
+
+  /**
+   * When the dated service journey is resolved from the EstimatedVehicleJourneyCode, the code must
+   * be normalized to a DatedServiceJourney id, matching the id under which {@link AddedTripBuilder}
+   * registers the added TripOnServiceDate. A code supplied in ServiceJourney form must be swapped.
+   */
+  @Test
+  void resolveDatedServiceJourneyIdFromServiceJourneyCode() {
+    var journey = journey(builder ->
+      builder.withEstimatedVehicleJourneyCode("RUT:ServiceJourney:1234")
+    );
+
+    assertEquals(
+      new FeedScopedId(FEED_ID, "RUT:DatedServiceJourney:1234"),
+      newResolver().resolveDatedServiceJourneyId(journey)
+    );
+  }
+
+  @Test
+  void resolveDatedServiceJourneyIdFromDatedServiceJourneyCode() {
+    var journey = journey(builder ->
+      builder.withEstimatedVehicleJourneyCode("RUT:DatedServiceJourney:1234")
+    );
+
+    assertEquals(
+      new FeedScopedId(FEED_ID, "RUT:DatedServiceJourney:1234"),
+      newResolver().resolveDatedServiceJourneyId(journey)
+    );
+  }
+
+  /**
+   * A DatedVehicleJourneyRef takes precedence over the EstimatedVehicleJourneyCode and is resolved
+   * verbatim, without entity-type normalization.
+   */
+  @Test
+  void resolveDatedServiceJourneyIdFromDatedVehicleJourneyRef() {
+    var journey = journey(builder ->
+      builder
+        .withDatedVehicleJourneyRef("RUT:DatedServiceJourney:5678")
+        .withEstimatedVehicleJourneyCode("RUT:ServiceJourney:1234")
+    );
+
+    assertEquals(
+      new FeedScopedId(FEED_ID, "RUT:DatedServiceJourney:5678"),
+      newResolver().resolveDatedServiceJourneyId(journey)
+    );
+  }
+
+  private static EntityResolver newResolver() {
+    return newResolver(new TransitRepository());
+  }
+
+  private static EntityResolver newResolver(TransitRepository transitRepository) {
+    var timetableDataImport = new TimetableDataImport();
+    var scheduledTimetableData = timetableDataImport.toScheduledTimetableData();
+    var timetableRepository = new DefaultTimetableRepository(
+      RaptorTransitDataTestFactory.empty(),
+      scheduledTimetableData
+    );
+    return new EntityResolver(timetableRepository, transitRepository, FEED_ID);
+  }
+
+  private static EstimatedVehicleJourneyWrapper journey(UnaryOperator<SiriEtBuilder> configure) {
+    var timeParser = new LocalTimeParser(ZoneId.of("Europe/Oslo"), LocalDate.of(2026, 6, 29));
+    return EstimatedVehicleJourneyWrapper.of(
+      configure.apply(new SiriEtBuilder(timeParser)).buildEstimatedVehicleJourney()
+    );
+  }
+}

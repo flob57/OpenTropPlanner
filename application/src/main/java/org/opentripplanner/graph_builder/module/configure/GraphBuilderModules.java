@@ -1,0 +1,567 @@
+package org.opentripplanner.graph_builder.module.configure;
+
+import dagger.Module;
+import dagger.Provides;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.core.model.deduplicator.DeduplicatorService;
+import org.opentripplanner.datastore.api.CompositeDataSource;
+import org.opentripplanner.datastore.api.DataSource;
+import org.opentripplanner.ext.dataoverlay.EdgeUpdaterModule;
+import org.opentripplanner.ext.dataoverlay.configure.DataOverlayFactory;
+import org.opentripplanner.ext.flex.FlexIndex;
+import org.opentripplanner.ext.stopconsolidation.StopConsolidationModule;
+import org.opentripplanner.ext.stopconsolidation.StopConsolidationRepository;
+import org.opentripplanner.ext.transferanalyzer.DirectTransferAnalyzer;
+import org.opentripplanner.framework.application.OTPFeature;
+import org.opentripplanner.graph_builder.GraphBuilderDataSources;
+import org.opentripplanner.graph_builder.issue.api.DataImportIssueStore;
+import org.opentripplanner.graph_builder.issue.api.DataImportIssueSummary;
+import org.opentripplanner.graph_builder.issue.report.DataImportIssueReporter;
+import org.opentripplanner.graph_builder.issue.service.DefaultDataImportIssueStore;
+import org.opentripplanner.graph_builder.model.ConfiguredDataSource;
+import org.opentripplanner.graph_builder.module.OsmBoardingLocationsModule;
+import org.opentripplanner.graph_builder.module.RouteToCentroidStationIdsValidator;
+import org.opentripplanner.graph_builder.module.StreetLinkerModule;
+import org.opentripplanner.graph_builder.module.TurnRestrictionModule;
+import org.opentripplanner.graph_builder.module.cache.GraphBuildCacheManager;
+import org.opentripplanner.graph_builder.module.islandpruning.IslandPruningModule;
+import org.opentripplanner.graph_builder.module.islandpruning.IslandPruningParameters;
+import org.opentripplanner.graph_builder.module.ned.DegreeGridNEDTileSource;
+import org.opentripplanner.graph_builder.module.ned.ElevationModule;
+import org.opentripplanner.graph_builder.module.ned.GeotiffGridCoverageFactoryImpl;
+import org.opentripplanner.graph_builder.module.ned.NEDGridCoverageFactoryImpl;
+import org.opentripplanner.graph_builder.module.ned.parameter.DemExtractParameters;
+import org.opentripplanner.graph_builder.module.osm.EdgeNamer;
+import org.opentripplanner.graph_builder.module.osm.OsmModule;
+import org.opentripplanner.graph_builder.module.osm.parameters.OsmExtractParameters;
+import org.opentripplanner.graph_builder.module.stopconnectivity.StopConnectivityModule;
+import org.opentripplanner.graph_builder.services.ned.ElevationGridCoverageFactory;
+import org.opentripplanner.gtfs.graphbuilder.GtfsBundle;
+import org.opentripplanner.gtfs.graphbuilder.GtfsModule;
+import org.opentripplanner.netex.NetexModule;
+import org.opentripplanner.netex.configure.NetexConfigure;
+import org.opentripplanner.osm.DefaultOsmProvider;
+import org.opentripplanner.osm.OsmProvider;
+import org.opentripplanner.place.api.NearbyStop;
+import org.opentripplanner.routing.api.request.preference.WalkPreferences;
+import org.opentripplanner.routing.fares.FareServiceFactory;
+import org.opentripplanner.service.osminfo.OsmInfoGraphBuildRepository;
+import org.opentripplanner.service.osminfo.OsmInfoGraphBuildService;
+import org.opentripplanner.service.streetdetails.StreetDetailsRepository;
+import org.opentripplanner.service.vehicleparking.VehicleParkingRepository;
+import org.opentripplanner.standalone.config.BuildConfig;
+import org.opentripplanner.street.StreetRepository;
+import org.opentripplanner.street.graph.Graph;
+import org.opentripplanner.street.linking.VertexLinker;
+import org.opentripplanner.transfer.configure.StreetTransferFactory;
+import org.opentripplanner.transfer.dataimport.FlexTransferGenerator;
+import org.opentripplanner.transfer.dataimport.RegularTransitTransferGenerator;
+import org.opentripplanner.transfer.dataimport.StopsAllowedForModes;
+import org.opentripplanner.transfer.dataimport.StopsVisitedByPatterns;
+import org.opentripplanner.transfer.regular.TransferRepository;
+import org.opentripplanner.transit.dataimport.TimetableDataImport;
+import org.opentripplanner.transit.model.framework.Deduplicator;
+import org.opentripplanner.transit.service.TransitRepository;
+import org.opentripplanner.transit.transfer.regular.RegularTransferBuildRepository;
+import org.opentripplanner.transit.transfer.regular.RegularTransferGenerator;
+
+/**
+ * Configure all modules that are not simple enough to be injected.
+ */
+@Module
+public class GraphBuilderModules {
+
+  /**
+   * TODO: The transfer analyzer should have its own search radius, it should not be a transfer
+   *       duration, since it is only used to find the nearby stops it analyzes.
+   */
+  private static final Duration ANALYZER_MAX_DURATION = Duration.ofMinutes(30);
+
+  @Provides
+  @Singleton
+  static GraphBuildCacheManager provideGraphBuildCacheManager(
+    BuildConfig config,
+    GraphBuilderDataSources dataSources
+  ) {
+    return new GraphBuildCacheManager(config.cache(), dataSources.listCachedDataSources());
+  }
+
+  @Provides
+  @Singleton
+  static OsmModule provideOsmModule(
+    GraphBuilderDataSources dataSources,
+    BuildConfig config,
+    Graph graph,
+    OsmInfoGraphBuildRepository osmInfoGraphBuildRepository,
+    StreetDetailsRepository streetDetailsRepository,
+    StreetRepository streetRepository,
+    VehicleParkingRepository vehicleParkingRepository,
+    EdgeNamer edgeNamer,
+    DataImportIssueStore issueStore,
+    GraphBuildCacheManager cacheManager
+  ) {
+    List<OsmProvider> providers = new ArrayList<>();
+    for (ConfiguredDataSource<OsmExtractParameters> osmConfiguredDataSource : dataSources.getOsmConfiguredDataSource()) {
+      providers.add(
+        new DefaultOsmProvider(
+          osmConfiguredDataSource.dataSource(),
+          osmConfiguredDataSource.config().osmTagMapper(),
+          osmConfiguredDataSource.config().timeZone(),
+          config.osmCacheDataInMem
+        )
+      );
+    }
+
+    return OsmModule.of(
+      providers,
+      graph,
+      osmInfoGraphBuildRepository,
+      streetDetailsRepository,
+      streetRepository,
+      vehicleParkingRepository
+    )
+      .withEdgeNamer(edgeNamer)
+      .withAreaVisibility(config.areaVisibility)
+      .withPlatformEntriesLinking(config.platformEntriesLinking)
+      .withStaticParkAndRide(config.staticParkAndRide)
+      .withStaticBikeParkAndRide(config.staticBikeParkAndRide)
+      .withIncludeInclinedEdgeLevelInfo(config.includeInclinedEdgeLevelInfo)
+      .withMaxAreaNodes(config.maxAreaNodes)
+      .withBoardingAreaRefTags(config.boardingLocations.refTags())
+      .withElevatorRefTags(config.elevatorRefTags)
+      .withIncludeOsmStationEntrances(config.osmDefaults.includeOsmStationEntrances())
+      .withCacheManager(cacheManager)
+      .withIssueStore(issueStore)
+      .build();
+  }
+
+  @Provides
+  @Singleton
+  static OsmBoardingLocationsModule provideOsmBoardingLocationsModule(
+    Graph graph,
+    BuildConfig config,
+    TransitRepository transitRepository,
+    VertexLinker linker,
+    OsmInfoGraphBuildService osmInfoGraphBuildService,
+    DataImportIssueStore issueStore
+  ) {
+    return new OsmBoardingLocationsModule(
+      graph,
+      transitRepository,
+      linker,
+      osmInfoGraphBuildService,
+      config.boardingLocations.coordinateSource(),
+      issueStore
+    );
+  }
+
+  @Provides
+  @Singleton
+  static GtfsModule provideGtfsModule(
+    GraphBuilderDataSources dataSources,
+    BuildConfig config,
+    Graph graph,
+    DeduplicatorService deduplicator,
+    TransitRepository transitRepository,
+    TimetableDataImport timetableDataImport,
+    StreetDetailsRepository streetDetailsRepository,
+    DataImportIssueStore issueStore,
+    FareServiceFactory fareServiceFactory
+  ) {
+    List<GtfsBundle> gtfsBundles = new ArrayList<>();
+    for (var gtfsData : dataSources.getGtfsConfiguredDataSource()) {
+      gtfsBundles.add(new GtfsBundle(gtfsData.dataSource(), gtfsData.config()));
+    }
+    return new GtfsModule(
+      gtfsBundles,
+      transitRepository,
+      timetableDataImport,
+      streetDetailsRepository,
+      graph,
+      deduplicator,
+      issueStore,
+      config.getTransitServicePeriod(),
+      fareServiceFactory,
+      config.maxStopToShapeSnapDistance,
+      config.transitShapeSimplificationToleranceMeters(),
+      config.getSubwayAccessTimeSeconds()
+    );
+  }
+
+  @Provides
+  @Singleton
+  static NetexModule provideNetexModule(
+    GraphBuilderDataSources dataSources,
+    BuildConfig config,
+    Graph graph,
+    DeduplicatorService deduplicator,
+    TransitRepository transitRepository,
+    TimetableDataImport timetableDataImport,
+    StreetDetailsRepository streetDetailsRepository,
+    VehicleParkingRepository parkingRepository,
+    DataImportIssueStore issueStore
+  ) {
+    return new NetexConfigure(config).createNetexModule(
+      dataSources.getNetexConfiguredDataSource(),
+      transitRepository,
+      timetableDataImport,
+      parkingRepository,
+      streetDetailsRepository,
+      graph,
+      deduplicator,
+      issueStore
+    );
+  }
+
+  @Provides
+  @Singleton
+  static StreetLinkerModule provideStreetLinkerModule(
+    Graph graph,
+    VehicleParkingRepository parkingRepository,
+    TransitRepository transitRepository,
+    TimetableDataImport timetableDataImport,
+    DataImportIssueStore issueStore,
+    VertexLinker linker
+  ) {
+    return new StreetLinkerModule(
+      graph,
+      linker,
+      parkingRepository,
+      transitRepository,
+      timetableDataImport,
+      issueStore
+    );
+  }
+
+  @Provides
+  @Singleton
+  static StopConnectivityModule provideStopConnectivityModule(
+    Graph graph,
+    TransitRepository transitRepository,
+    DataImportIssueStore issueStore
+  ) {
+    return new StopConnectivityModule(
+      graph,
+      () -> transitRepository.getSiteRepository().listRegularStops().size(),
+      issueStore
+    );
+  }
+
+  @Provides
+  @Singleton
+  static IslandPruningModule provideIslandPruningModule(
+    BuildConfig config,
+    Graph graph,
+    VehicleParkingRepository parkingRepository,
+    TransitRepository transitRepository,
+    TimetableDataImport timetableDataImport,
+    DataImportIssueStore issueStore,
+    VertexLinker linker
+  ) {
+    var parameters = IslandPruningParameters.of()
+      .withPruningThresholdIslandWithoutStops(
+        config.islandPruning.pruningThresholdIslandWithoutStops
+      )
+      .withPruningThresholdIslandWithStops(config.islandPruning.pruningThresholdIslandWithStops)
+      .withAdaptivePruningFactor(config.islandPruning.adaptivePruningFactor)
+      .withAdaptivePruningDistance(config.islandPruning.adaptivePruningDistance)
+      .build();
+    return new IslandPruningModule(
+      graph,
+      transitRepository,
+      issueStore,
+      new StreetLinkerModule(
+        graph,
+        linker,
+        parkingRepository,
+        transitRepository,
+        timetableDataImport,
+        issueStore
+      ),
+      parameters
+    );
+  }
+
+  @Provides
+  @Singleton
+  static List<ElevationModule> provideElevationModules(
+    BuildConfig config,
+    GraphBuilderDataSources dataSources,
+    Graph graph,
+    OsmModule osmModule,
+    DataImportIssueStore issueStore,
+    GraphBuildCacheManager cacheManager
+  ) {
+    List<ElevationModule> result = new ArrayList<>();
+    List<ElevationGridCoverageFactory> gridCoverageFactories = new ArrayList<>();
+    if (config.elevationBucket != null) {
+      gridCoverageFactories.add(
+        createNedElevationFactory(dataSources.getNedCacheDirectory(), config)
+      );
+    } else if (dataSources.hasDem()) {
+      gridCoverageFactories.addAll(
+        createDemGeotiffGridCoverageFactories(dataSources.getDemConfiguredDataSource())
+      );
+    }
+    // Refactoring this class, it was made clear that this allows for adding multiple elevation
+    // modules to the same graph builder. We do not actually know if this is supported by the
+    // ElevationModule class.
+    for (ElevationGridCoverageFactory it : gridCoverageFactories) {
+      result.add(createElevationModule(config, graph, issueStore, it, osmModule, cacheManager));
+    }
+    return result;
+  }
+
+  @Provides
+  @Singleton
+  static FlexTransferGenerator provideFlexTransferGenerator(
+    BuildConfig config,
+    Graph graph,
+    TransitRepository transitRepository,
+    TimetableDataImport timetableDataImport,
+    TransferRepository transferRepository,
+    Provider<FlexIndex> flexIndex
+  ) {
+    return new FlexTransferGenerator(
+      graph,
+      transitRepository,
+      timetableDataImport,
+      transferRepository,
+      flexIndex,
+      config.flexTransferParameters()
+    );
+  }
+
+  /**
+   * The flex trips of the imported transit data, shared by the transfer generators. It is created
+   * on first use, so it must not be requested before the transit data is imported. {@code null} if
+   * flex routing is off.
+   */
+  @Provides
+  @Singleton
+  @Nullable
+  static FlexIndex provideFlexIndex(TimetableDataImport timetableDataImport) {
+    return OTPFeature.FlexRouting.isOn()
+      ? new FlexIndex(timetableDataImport.getAllFlexTrips(), timetableDataImport.getTripCalendars())
+      : null;
+  }
+
+  @Provides
+  @Singleton
+  static RegularTransferGenerator provideRegularTransferGenerator(
+    BuildConfig config,
+    Graph graph,
+    TransitRepository transitRepository,
+    StopsVisitedByPatterns stopsVisitedByPatterns,
+    StopsAllowedForModes stopsAllowedForModes,
+    RegularTransferBuildRepository<NearbyStop> regularTransferBuildRepository,
+    @Nullable FlexIndex flexIndex
+  ) {
+    // The generator is created when the transfers are generated, after the transit data import
+    return StreetTransferFactory.createGenerator(
+      graph,
+      transitRepository,
+      config.transferProfiles(),
+      regularTransferBuildRepository,
+      stopsVisitedByPatterns,
+      stopsAllowedForModes,
+      flexIndex
+    );
+  }
+
+  @Provides
+  @Singleton
+  static StopsVisitedByPatterns provideStopsVisitedByPatterns(
+    TimetableDataImport timetableDataImport
+  ) {
+    return new StopsVisitedByPatterns(timetableDataImport);
+  }
+
+  @Provides
+  @Singleton
+  static StopsAllowedForModes provideStopsAllowedForModes(
+    TimetableDataImport timetableDataImport,
+    StopsVisitedByPatterns stopsVisitedByPatterns
+  ) {
+    return new StopsAllowedForModes(timetableDataImport, stopsVisitedByPatterns);
+  }
+
+  @Provides
+  @Singleton
+  static RegularTransitTransferGenerator provideRegularTransitTransferGenerator(
+    Provider<RegularTransferGenerator> transferGenerator,
+    Graph graph,
+    TransitRepository transitRepository,
+    StopsVisitedByPatterns stopsVisitedByPatterns,
+    DataImportIssueStore issueStore
+  ) {
+    return new RegularTransitTransferGenerator(
+      transferGenerator,
+      graph,
+      transitRepository,
+      stopsVisitedByPatterns,
+      issueStore
+    );
+  }
+
+  @Provides
+  @Singleton
+  static DirectTransferAnalyzer provideDirectTransferAnalyzer(
+    Graph graph,
+    VertexLinker linker,
+    TransitRepository transitRepository,
+    DataImportIssueStore issueStore
+  ) {
+    return new DirectTransferAnalyzer(
+      graph,
+      linker,
+      transitRepository,
+      issueStore,
+      ANALYZER_MAX_DURATION.toSeconds() * WalkPreferences.DEFAULT.speed()
+    );
+  }
+
+  @Provides
+  @Singleton
+  @Nullable
+  static EdgeUpdaterModule provideDataOverlayFactory(BuildConfig config, Graph graph) {
+    return DataOverlayFactory.create(graph, config.dataOverlay);
+  }
+
+  @Provides
+  @Singleton
+  static DataImportIssueStore provideDataImportIssuesStore() {
+    return new DefaultDataImportIssueStore();
+  }
+
+  @Provides
+  @Singleton
+  static DataImportIssueReporter provideDataImportIssuesToHTML(
+    GraphBuilderDataSources dataSources,
+    BuildConfig config,
+    DataImportIssueStore issueStore
+  ) {
+    return new DataImportIssueReporter(
+      issueStore,
+      dataSources.getBuildReportDir(),
+      config.maxDataImportIssuesPerType,
+      config.maxDataImportIssuesPerFile
+    );
+  }
+
+  @Provides
+  @Singleton
+  static DataImportIssueSummary providesDataImportIssueSummary(DataImportIssueStore issueStore) {
+    return new DataImportIssueSummary(issueStore.listIssues());
+  }
+
+  @Provides
+  @Singleton
+  static TurnRestrictionModule provideTurnRestrictionModule(
+    Graph graph,
+    OsmInfoGraphBuildRepository osmInfoGraphBuildRepository
+  ) {
+    return new TurnRestrictionModule(graph, osmInfoGraphBuildRepository);
+  }
+
+  @Provides
+  @Singleton
+  @Nullable
+  static StopConsolidationModule providesStopConsolidationModule(
+    TransitRepository transitRepository,
+    TimetableDataImport timetableDataImport,
+    @Nullable StopConsolidationRepository repo,
+    GraphBuilderDataSources dataSources
+  ) {
+    return dataSources
+      .stopConsolidation()
+      .map(ds -> StopConsolidationModule.of(transitRepository, timetableDataImport, repo, ds))
+      .orElse(null);
+  }
+
+  @Provides
+  @Singleton
+  @Nullable
+  static RouteToCentroidStationIdsValidator routeToCentroidStationIdValidator(
+    DataImportIssueStore issueStore,
+    BuildConfig config,
+    TransitRepository transitRepository
+  ) {
+    var ids = config.transitRouteToStationCentroid();
+    return ids.isEmpty()
+      ? null
+      : new RouteToCentroidStationIdsValidator(issueStore, ids, transitRepository);
+  }
+
+  @Provides
+  @Singleton
+  DeduplicatorService provideDeduplicator() {
+    return new Deduplicator();
+  }
+
+  /* private methods */
+
+  private static ElevationGridCoverageFactory createNedElevationFactory(
+    CompositeDataSource nedCacheDir,
+    BuildConfig config
+  ) {
+    // Download the elevation tiles from an Amazon S3 bucket
+    DegreeGridNEDTileSource awsTileSource = new DegreeGridNEDTileSource();
+    awsTileSource.awsAccessKey = config.elevationBucket.accessKey;
+    awsTileSource.awsSecretKey = config.elevationBucket.secretKey;
+    awsTileSource.awsBucketName = config.elevationBucket.bucketName;
+
+    return new NEDGridCoverageFactoryImpl(
+      nedCacheDir,
+      config.elevationBucket.datumUrl,
+      awsTileSource
+    );
+  }
+
+  private static List<ElevationGridCoverageFactory> createDemGeotiffGridCoverageFactories(
+    Iterable<ConfiguredDataSource<DemExtractParameters>> dataSources
+  ) {
+    List<ElevationGridCoverageFactory> elevationGridCoverageFactories = new ArrayList<>();
+    for (ConfiguredDataSource<DemExtractParameters> demSource : dataSources) {
+      double elevationUnitMultiplier = demSource.config().elevationUnitMultiplier();
+      elevationGridCoverageFactories.add(
+        createGeotiffGridCoverageFactoryImpl(demSource.dataSource(), elevationUnitMultiplier)
+      );
+    }
+    return elevationGridCoverageFactories;
+  }
+
+  private static ElevationModule createElevationModule(
+    BuildConfig config,
+    Graph graph,
+    DataImportIssueStore issueStore,
+    ElevationGridCoverageFactory it,
+    OsmModule osmModule,
+    GraphBuildCacheManager cacheManager
+  ) {
+    return new ElevationModule(
+      it,
+      graph,
+      issueStore,
+      cacheManager,
+      osmModule.elevationDataOutput(),
+      config.distanceBetweenElevationSamples,
+      config.maxElevationPropagationMeters,
+      config.includeEllipsoidToGeoidDifference,
+      config.multiThreadElevationCalculations,
+      config.elevationTileCacheSizeMB
+    );
+  }
+
+  private static ElevationGridCoverageFactory createGeotiffGridCoverageFactoryImpl(
+    DataSource demSource,
+    double elevationUnitMultiplier
+  ) {
+    return new GeotiffGridCoverageFactoryImpl(demSource, elevationUnitMultiplier);
+  }
+}

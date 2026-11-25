@@ -1,0 +1,133 @@
+package org.opentripplanner.standalone.configure;
+
+import dagger.BindsInstance;
+import dagger.Component;
+import jakarta.inject.Singleton;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.datastore.OtpDataStore;
+import org.opentripplanner.datastore.configure.DataStoreModule;
+import org.opentripplanner.ext.datastore.gs.GsDataSourceModule;
+import org.opentripplanner.ext.emission.EmissionRepository;
+import org.opentripplanner.ext.emission.configure.EmissionRepositoryModule;
+import org.opentripplanner.ext.empiricaldelay.EmpiricalDelayRepository;
+import org.opentripplanner.ext.empiricaldelay.configure.EmpiricalDelayRepositoryModule;
+import org.opentripplanner.ext.fares.configure.FareModule;
+import org.opentripplanner.ext.stopconsolidation.StopConsolidationRepository;
+import org.opentripplanner.ext.stopconsolidation.configure.StopConsolidationRepositoryModule;
+import org.opentripplanner.ext.taxi.TaxiRepository;
+import org.opentripplanner.ext.taxi.configure.TaxiRepositoryModule;
+import org.opentripplanner.graph_builder.GraphBuilderDataSources;
+import org.opentripplanner.place.api.NearbyStop;
+import org.opentripplanner.routing.fares.FareServiceFactory;
+import org.opentripplanner.service.osminfo.OsmInfoGraphBuildRepository;
+import org.opentripplanner.service.osminfo.configure.OsmInfoGraphBuildRepositoryModule;
+import org.opentripplanner.service.streetdetails.StreetDetailsRepository;
+import org.opentripplanner.service.streetdetails.configure.StreetDetailsRepositoryModule;
+import org.opentripplanner.service.vehicleparking.VehicleParkingRepository;
+import org.opentripplanner.service.vehicleparking.configure.VehicleParkingRepositoryModule;
+import org.opentripplanner.service.worldenvelope.WorldEnvelopeRepository;
+import org.opentripplanner.service.worldenvelope.configure.WorldEnvelopeRepositoryModule;
+import org.opentripplanner.standalone.config.CommandLineParameters;
+import org.opentripplanner.standalone.config.ConfigModel;
+import org.opentripplanner.standalone.config.configure.DeduplicatorServiceModule;
+import org.opentripplanner.standalone.config.configure.LoadConfigModule;
+import org.opentripplanner.street.StreetRepository;
+import org.opentripplanner.street.configure.StreetRepositoryModule;
+import org.opentripplanner.street.graph.Graph;
+import org.opentripplanner.transfer.configure.RegularTransferBuildRepositoryModule;
+import org.opentripplanner.transfer.regular.TransferRepository;
+import org.opentripplanner.transfer.regular.configure.TransferRepositoryModule;
+import org.opentripplanner.transit.configure.TimetableDataImportModule;
+import org.opentripplanner.transit.dataimport.TimetableDataImport;
+import org.opentripplanner.transit.service.TransitRepository;
+import org.opentripplanner.transit.transfer.regular.RegularTransferBuildRepository;
+
+/**
+ * Dagger dependency injection Factory to create components for the OTP load application phase.
+ */
+@Singleton
+@Component(
+  modules = {
+    LoadConfigModule.class,
+    DataStoreModule.class,
+    DeduplicatorServiceModule.class,
+    GsDataSourceModule.class,
+    OsmInfoGraphBuildRepositoryModule.class,
+    StreetDetailsRepositoryModule.class,
+    WorldEnvelopeRepositoryModule.class,
+    EmissionRepositoryModule.class,
+    TaxiRepositoryModule.class,
+    EmpiricalDelayRepositoryModule.class,
+    StopConsolidationRepositoryModule.class,
+    StreetRepositoryModule.class,
+    TransferRepositoryModule.class,
+    TimetableDataImportModule.class,
+    RegularTransferBuildRepositoryModule.class,
+    VehicleParkingRepositoryModule.class,
+    FareModule.class,
+    DeduplicatorServiceModule.class,
+  }
+)
+public interface LoadApplicationFactory {
+  OtpDataStore datastore();
+
+  ConfigModel configModel();
+
+  @Singleton
+  Graph emptyGraph();
+
+  @Singleton
+  OsmInfoGraphBuildRepository emptyOsmInfoGraphBuildRepository();
+
+  @Singleton
+  StreetDetailsRepository emptyStreetDetailsRepository();
+
+  @Singleton
+  TransitRepository emptyTransitRepository();
+
+  @Singleton
+  TimetableDataImport emptyTimetableDataImport();
+
+  @Singleton
+  TransferRepository emptyTransferRepository();
+
+  @Singleton
+  RegularTransferBuildRepository<NearbyStop> emptyRegularTransferBuildRepository();
+
+  @Singleton
+  WorldEnvelopeRepository emptyWorldEnvelopeRepository();
+
+  @Singleton
+  GraphBuilderDataSources graphBuilderDataSources();
+
+  @Singleton
+  EmissionRepository emptyEmissionsDataModel();
+
+  @Singleton
+  TaxiRepository emptyTaxiRepository();
+
+  @Singleton
+  @Nullable
+  EmpiricalDelayRepository emptyEmpiricalDelayRepository();
+
+  @Singleton
+  StopConsolidationRepository emptyStopConsolidationRepository();
+
+  @Singleton
+  StreetRepository emptyStreetRepository();
+
+  @Singleton
+  FareServiceFactory emptyFareServiceFactory();
+
+  @Singleton
+  VehicleParkingRepository emptyVehicleParkingRepository();
+
+  @Singleton
+  @Component.Builder
+  interface Builder {
+    @BindsInstance
+    Builder commandLineParameters(CommandLineParameters cli);
+
+    LoadApplicationFactory build();
+  }
+}

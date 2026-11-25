@@ -1,0 +1,242 @@
+package org.opentripplanner.ext.carpooling.model;
+
+import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.street.geometry.WgsCoordinate;
+import org.opentripplanner.transit.model.framework.AbstractTransitEntity;
+import org.opentripplanner.transit.model.framework.LogInfo;
+import org.opentripplanner.transit.model.framework.TransitBuilder;
+import org.opentripplanner.transit.model.organization.ContactInfo;
+
+/**
+ * Represents a driver's carpool journey with planned route, timing, and passenger capacity.
+ * <p>
+ * A carpool trip models a driver offering their vehicle journey for passengers to join. It
+ * includes the driver's planned route as a sequence of stops, total vehicle capacity, and timing
+ * constraints including a deviation budget that allows the driver to slightly adjust their route to
+ * accommodate passengers.
+ *
+ * <h2>Core Concepts</h2>
+ * <ul>
+ *   <li><strong>Origin/Destination Areas:</strong> Start and end zones for the driver's journey</li>
+ *   <li><strong>Stops:</strong> Ordered sequence of waypoints along the route where passengers can be
+ *       picked up or dropped off. Stops are dynamically updated as bookings occur.</li>
+ *   <li><strong>Total Capacity:</strong> Number of seats in the car, including the driver seat</li>
+ * </ul>
+ *
+ * <h2>Data Source</h2>
+ * <p>
+ * Trips are typically created from SIRI-ET messages provided by external carpooling platforms.
+ * The platform manages driver registrations, trip creation, and real-time updates as passengers
+ * book or cancel rides.
+ *
+ * <h2>Immutability</h2>
+ * <p>
+ * CarpoolTrip instances are immutable. Updates to trip state (e.g., adding a booked passenger)
+ * require creating a new trip instance via {@link CarpoolTripBuilder} and upserting it to the
+ * {@link org.opentripplanner.ext.carpooling.CarpoolingRepository}.
+ *
+ * <h2>Usage in Routing</h2>
+ * <p>
+ * The routing algorithm uses trips to find compatible matches for passenger requests:
+ * <ol>
+ *   <li>Filters check basic compatibility (capacity, timing, direction)</li>
+ *   <li>Insertion strategy finds optimal pickup/dropoff positions along the route, keeping every leg
+ *       the passenger rides within capacity and every later stop within its deviation budget</li>
+ * </ol>
+ *
+ * @see CarpoolStop for individual stop details
+ * @see CarpoolTripBuilder for constructing trip instances
+ * @see org.opentripplanner.ext.carpooling.updater.SiriETCarpoolingUpdater for trip updates
+ */
+public class CarpoolTrip
+  extends AbstractTransitEntity<CarpoolTrip, CarpoolTripBuilder>
+  implements LogInfo
+{
+
+  /** Default total capacity (including driver) when no capacity information is provided. */
+  public static final int DEFAULT_TOTAL_CAPACITY = 5;
+
+  private final ZonedDateTime startTime;
+  private final ZonedDateTime endTime;
+  private final String provider;
+  private final int totalCapacity;
+
+  // Ordered list of stops along the carpool route where passengers can be picked up or dropped off
+  private final List<CarpoolStop> stops;
+
+  private final Duration[] legDeviationBudgets;
+
+  @Nullable
+  private final ContactInfo publicContactInformation;
+
+  public CarpoolTrip(CarpoolTripBuilder builder) {
+    super(builder.getId());
+    this.startTime = Objects.requireNonNull(builder.startTime());
+    this.endTime = Objects.requireNonNull(builder.endTime());
+    this.provider = builder.provider();
+    this.totalCapacity = builder.totalCapacity();
+    this.stops = Collections.unmodifiableList(builder.stops());
+    if (stops.size() < 2) {
+      throw new IllegalArgumentException(
+        "Carpool trip " + getId() + " must contain at least an origin and a destination stop"
+      );
+    }
+    this.legDeviationBudgets = new Duration[stops.size() - 1];
+    var budget = stops.getLast().getDeviationBudget();
+    for (int leg = legDeviationBudgets.length - 1; leg >= 0; leg--) {
+      var stopBudget = stops.get(leg + 1).getDeviationBudget();
+      if (stopBudget.compareTo(budget) < 0) {
+        budget = stopBudget;
+      }
+      legDeviationBudgets[leg] = budget;
+    }
+    this.publicContactInformation = builder.publicContactInformation();
+  }
+
+  /**
+   * Returns the origin stop (first stop in the trip).
+   */
+  public CarpoolStop getOrigin() {
+    return stops.getFirst();
+  }
+
+  /**
+   * Returns the destination stop (last stop in the trip).
+   */
+  public CarpoolStop getDestination() {
+    return stops.getLast();
+  }
+
+  public ZonedDateTime startTime() {
+    return startTime;
+  }
+
+  public ZonedDateTime endTime() {
+    return endTime;
+  }
+
+  /**
+   * Returns the latest expected arrival time of the destination stop if available, otherwise falls
+   * back to {@link #endTime()}.
+   *
+   * @return the latest expected end time of the trip
+   */
+  public ZonedDateTime latestEndTime() {
+    var latest = getDestination().getLatestExpectedArrivalTime();
+    return latest != null ? latest : endTime;
+  }
+
+  public String provider() {
+    return provider;
+  }
+
+  /**
+   * @return Total number of seats in the vehicle, including the driver seat
+   */
+  public int totalCapacity() {
+    return totalCapacity;
+  }
+
+  /**
+   * Returns the ordered sequence of stops along the carpool route.
+   * <p>
+   * Stops include both the driver's originally planned stops and any dynamically added stops for
+   * passenger pickups and dropoffs. The list is ordered by visit order along the route: the first
+   * element is the origin and the last is the destination.
+   *
+   * @return an immutable list of stops along the carpool route, in visit order; never null, and
+   *         always contains at least the origin and destination
+   */
+  public List<CarpoolStop> stops() {
+    return stops;
+  }
+
+  @Nullable
+  public ContactInfo publicContactInformation() {
+    return publicContactInformation;
+  }
+
+  /**
+   * Builds the full list of route points including origin area, all stops, and destination area.
+   * <p>
+   * This list represents the complete path of the carpool trip, useful for distance and
+   * direction calculations during filtering and matching.
+   *
+   * @return a list of coordinates representing the full route of the trip
+   */
+  public List<WgsCoordinate> routePoints() {
+    return stops.stream().map(CarpoolStop::getCoordinate).toList();
+  }
+
+  /**
+   * Returns the number of passengers onboard the vehicle when departing the given stop.
+   *
+   * @param stopIndex The 0-based index of the stop in the stop list
+   * @return Number of passengers onboard when departing from this stop
+   * @throws IllegalArgumentException if stopIndex is out of bounds
+   */
+  public int getPassengerCountAtDepartureOfStop(int stopIndex) {
+    if (stopIndex < 0 || stopIndex >= stops.size()) {
+      throw new IllegalArgumentException(
+        "Stop index " + stopIndex + " is out of bounds (0 to " + (stops.size() - 1) + ")"
+      );
+    }
+
+    return stops.get(stopIndex).getOnboardCount();
+  }
+
+  /** Whether one more passenger fits on the leg from stop {@code leg} to the next. */
+  public boolean hasFreeSeat(int leg) {
+    return getPassengerCountAtDepartureOfStop(leg) < totalCapacity;
+  }
+
+  /**
+   * The deviation budget of the leg from stop {@code leg}: the budget of the stop it ends at, or of
+   * a later stop if that is smaller, since a delay on the leg delays every later stop too.
+   */
+  public Duration legDeviationBudget(int leg) {
+    return legDeviationBudgets[leg];
+  }
+
+  @Nullable
+  @Override
+  public String logName() {
+    return getId().toString();
+  }
+
+  /** Value comparison: same id and content, the stops compared by value too. */
+  @Override
+  public boolean sameAs(CarpoolTrip other) {
+    return (
+      getId().equals(other.getId()) &&
+      startTime.equals(other.startTime) &&
+      endTime.equals(other.endTime) &&
+      Objects.equals(provider, other.provider) &&
+      totalCapacity == other.totalCapacity &&
+      sameStops(other.stops) &&
+      Objects.equals(publicContactInformation, other.publicContactInformation)
+    );
+  }
+
+  private boolean sameStops(List<CarpoolStop> otherStops) {
+    if (stops.size() != otherStops.size()) {
+      return false;
+    }
+    for (int i = 0; i < stops.size(); i++) {
+      if (!stops.get(i).sameAs(otherStops.get(i))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  @Override
+  public TransitBuilder<CarpoolTrip, CarpoolTripBuilder> copy() {
+    return new CarpoolTripBuilder(this);
+  }
+}

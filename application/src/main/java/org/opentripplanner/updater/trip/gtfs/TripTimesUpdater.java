@@ -1,0 +1,396 @@
+package org.opentripplanner.updater.trip.gtfs;
+
+import static org.opentripplanner.updater.spi.UpdateErrorType.INVALID_ARRIVAL_TIME;
+import static org.opentripplanner.updater.spi.UpdateErrorType.INVALID_DEPARTURE_TIME;
+import static org.opentripplanner.updater.spi.UpdateErrorType.TRIP_NOT_FOUND_IN_PATTERN;
+
+import com.google.transit.realtime.GtfsRealtime.TripUpdate.StopTimeUpdate.ScheduleRelationship;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.OptionalLong;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.core.model.deduplicator.DeduplicatorService;
+import org.opentripplanner.model.PickDrop;
+import org.opentripplanner.model.StopTime;
+import org.opentripplanner.transit.model.framework.DataValidationException;
+import org.opentripplanner.transit.model.network.StopPattern;
+import org.opentripplanner.transit.model.network.TripPattern;
+import org.opentripplanner.transit.model.timetable.RealTimeTripTimes;
+import org.opentripplanner.transit.model.timetable.RealTimeTripTimesBuilder;
+import org.opentripplanner.transit.model.timetable.Timetable;
+import org.opentripplanner.transit.model.timetable.Trip;
+import org.opentripplanner.transit.model.timetable.TripTimes;
+import org.opentripplanner.transit.model.timetable.TripTimesFactory;
+import org.opentripplanner.transit.repository.TimetableRepository;
+import org.opentripplanner.updater.spi.DataValidationExceptionMapper;
+import org.opentripplanner.updater.spi.UpdateException;
+import org.opentripplanner.updater.trip.gtfs.interpolation.BackwardsDelayInterpolator;
+import org.opentripplanner.updater.trip.gtfs.interpolation.BackwardsDelayPropagationType;
+import org.opentripplanner.updater.trip.gtfs.interpolation.ForwardsDelayInterpolator;
+import org.opentripplanner.updater.trip.gtfs.interpolation.ForwardsDelayPropagationType;
+import org.opentripplanner.updater.trip.gtfs.model.StopTimeUpdate;
+import org.opentripplanner.updater.trip.gtfs.model.TripTimesPatch;
+import org.opentripplanner.updater.trip.gtfs.model.TripUpdate;
+import org.opentripplanner.updater.trip.stoplistdiff.StopListDiff;
+import org.opentripplanner.updater.trip.stoplistdiff.StopListDiffComparand;
+import org.opentripplanner.updater.trip.stoplistdiff.StopListDiffEntry;
+import org.opentripplanner.utils.time.ServiceDateUtils;
+
+class TripTimesUpdater {
+
+  private final ZoneId timeZone;
+  private final DeduplicatorService deduplicator;
+
+  /**
+   * Maximum time in seconds since midnight for arrivals and departures
+   */
+  private static final long MAX_ARRIVAL_DEPARTURE_TIME = 48 * 60 * 60;
+
+  TripTimesUpdater(ZoneId timeZone, DeduplicatorService deduplicator) {
+    this.timeZone = timeZone;
+    this.deduplicator = deduplicator;
+  }
+
+  /**
+   * Apply the TripUpdate to the appropriate TripTimes from a Timetable. The existing TripTimes must
+   * not be modified directly because they may be shared with the underlying scheduledTimetable, or
+   * other updated Timetables. The {@link TimetableRepository} performs the protective copying of
+   * this Timetable. It is not done in this update method to avoid repeatedly cloning the same
+   * Timetable when several updates are applied to it at once. We assume here that all trips in a
+   * timetable are from the same feed, which should always be the case.
+   *
+   * @param tripUpdate     GTFS-RT trip update
+   * @param backwardsDelay Defines when delays are propagated to previous stops and if these stops
+   *                       are given the NO_DATA flag
+   * @return {@link TripTimesPatch} contains a new copy of updated TripTimes after TripUpdate has
+   *         been applied on TripTimes of trip with the id specified in the trip descriptor of the
+   *         TripUpdate and a list of stop indices that have been skipped with the realtime update.
+   * @throws UpdateException if there are any problems with the data
+   */
+  public TripTimesPatch createUpdatedTripTimesFromGtfsRt(
+    Timetable timetable,
+    TripUpdate tripUpdate,
+    ForwardsDelayPropagationType forwardsDelay,
+    BackwardsDelayPropagationType backwardsDelay
+  ) throws UpdateException {
+    var tripId = tripUpdate.tripId();
+
+    var tripTimes = timetable.getTripTimes(tripId);
+    if (tripTimes == null) {
+      throw UpdateException.of(tripId, TRIP_NOT_FOUND_IN_PATTERN);
+    }
+
+    RealTimeTripTimesBuilder builder = tripTimes.createRealTimeWithoutScheduledTimes();
+    tripUpdate.tripHeadsign().ifPresent(builder::withTripHeadsign);
+    // TODO: add support for changing trip short name
+
+    Map<Integer, PickDrop> updatedPickups = new HashMap<>();
+    Map<Integer, PickDrop> updatedDropoffs = new HashMap<>();
+    Map<Integer, String> replacedStopIndices = new HashMap<>();
+
+    final long today = ServiceDateUtils.asStartOfService(
+      tripUpdate.startDate(),
+      timeZone
+    ).toEpochSecond();
+
+    var mapper = new StopPositionMapper(tripId, tripTimes, timetable);
+
+    for (var i = 0; i < tripUpdate.stopTimeUpdates().size(); i++) {
+      var update = tripUpdate.stopTimeUpdates().get(i);
+      final int pos = mapper.stopPositionInPattern(i, update);
+
+      var scheduledStopId = timetable.getPattern().getStop(pos).getId().getId();
+      var scheduledStopHeadsign = tripTimes.getHeadsign(pos);
+      var scheduledPickup = timetable.getPattern().getBoardType(pos);
+      var scheduledDropoff = timetable.getPattern().getAlightType(pos);
+      update
+        .stopHeadsign()
+        .filter(x -> !Objects.equals(x, scheduledStopHeadsign))
+        .ifPresent(x -> builder.withStopHeadsign(pos, x));
+      update
+        .pickup()
+        .filter(x -> x != scheduledPickup)
+        .ifPresent(x -> updatedPickups.put(pos, x));
+      update
+        .dropoff()
+        .filter(x -> x != scheduledDropoff)
+        .ifPresent(x -> updatedDropoffs.put(pos, x));
+      update
+        .assignedStopId()
+        .filter(x -> !Objects.equals(x, scheduledStopId))
+        .ifPresent(x -> replacedStopIndices.put(pos, x));
+
+      var scheduleRelationship = update.scheduleRelationship();
+      // Handle each schedule relationship case
+      if (scheduleRelationship == ScheduleRelationship.SKIPPED) {
+        // Set status to cancelled
+        updatedPickups.put(pos, PickDrop.CANCELLED);
+        updatedDropoffs.put(pos, PickDrop.CANCELLED);
+        builder.withCanceled(pos);
+      } else if (scheduleRelationship == ScheduleRelationship.NO_DATA) {
+        // Set status to NO_DATA and delays to 0.
+        // Note: GTFS-RT requires NO_DATA stops to have no arrival departure times.
+        builder.withNoData(pos);
+      } else {
+        // Else the status is SCHEDULED, update times as needed.
+        if (!update.isArrivalValid()) {
+          throw UpdateException.of(tripId, INVALID_ARRIVAL_TIME, i);
+        }
+        if (!update.isDepartureValid()) {
+          throw UpdateException.of(tripId, INVALID_DEPARTURE_TIME, i);
+        }
+        setArrivalAndDeparture(builder, pos, update, today);
+      }
+    }
+
+    // Interpolate missing times for stops which don't have times associated. Note: Currently for
+    // GTFS-RT updates ONLY not for SIRI updates.
+    ForwardsDelayInterpolator.getInstance(forwardsDelay).interpolateDelay(builder);
+
+    BackwardsDelayInterpolator.getInstance(backwardsDelay).propagateBackwards(builder);
+
+    tripUpdate.wheelchairAccessibility().ifPresent(builder::withWheelchairAccessibility);
+    tripUpdate.vehicleId().ifPresent(builder::withVehicleId);
+
+    builder.withRealTimeUpdated();
+    // Validate for non-increasing times. Log error if present.
+    try {
+      var result = builder.build();
+      return new TripTimesPatch(result, updatedPickups, updatedDropoffs, replacedStopIndices);
+    } catch (DataValidationException e) {
+      throw DataValidationExceptionMapper.map(e);
+    }
+  }
+
+  /**
+   * Add a new or replacement trip to the snapshot
+   *
+   * @param trip                   trip
+   * @param tripUpdate             information about the trip
+   * @param stopAndStopTimeUpdates updates for the stops
+   * @param added                  whether this trip was added (extra Trip)
+   * @param tripPatternModified    whether the trip Pattern was tripPatternModified
+   * @param serviceCode            serviceCode of the trip
+   * @throws UpdateException if there are any errors with the TripUpdate
+   */
+  public TripTimesWithStopPattern createNewTripTimesFromGtfsRt(
+    Trip trip,
+    TripUpdate tripUpdate,
+    List<StopAndStopTimeUpdate> stopAndStopTimeUpdates,
+    boolean added,
+    boolean tripPatternModified,
+    int serviceCode
+  ) throws UpdateException {
+    // Calculate seconds since epoch on GTFS midnight (noon minus 12h) of service date
+    final long midnightSecondsSinceEpoch = ServiceDateUtils.asStartOfService(
+      tripUpdate.startDate(),
+      timeZone
+    ).toEpochSecond();
+
+    // Create StopTimes based on the scheduled times
+    final List<StopTime> stopTimes = new ArrayList<>(stopAndStopTimeUpdates.size());
+    for (final StopAndStopTimeUpdate item : stopAndStopTimeUpdates) {
+      final var update = item.stopTimeUpdate();
+
+      // Create stop time
+      final StopTime stopTime = new StopTime();
+      stopTime.setTrip(trip);
+      stopTime.setStop(item.stop());
+      // Set arrival time
+      final var arrival = update.scheduledArrivalTimeWithRealTimeFallback();
+      if (arrival.isPresent()) {
+        final var arrivalTime = arrival.getAsLong() - midnightSecondsSinceEpoch;
+        if (arrivalTime < 0 || arrivalTime > MAX_ARRIVAL_DEPARTURE_TIME) {
+          throw UpdateException.of(trip.getId(), INVALID_ARRIVAL_TIME);
+        }
+        stopTime.setArrivalTime((int) arrivalTime);
+      }
+      // Set departure time
+      final var departure = update.scheduledDepartureTimeWithRealTimeFallback();
+      if (departure.isPresent()) {
+        final long departureTime = departure.getAsLong() - midnightSecondsSinceEpoch;
+        if (departureTime < 0 || departureTime > MAX_ARRIVAL_DEPARTURE_TIME) {
+          throw UpdateException.of(trip.getId(), INVALID_DEPARTURE_TIME);
+        }
+        stopTime.setDepartureTime((int) departureTime);
+      }
+      // Exact time
+      stopTime.setTimepoint(1);
+      update.stopSequence().ifPresent(stopTime::setStopSequence);
+      stopTime.setPickupType(update.effectivePickup());
+      stopTime.setDropOffType(update.effectiveDropoff());
+      update.stopHeadsign().ifPresent(stopTime::setStopHeadsign);
+      // Add stop time to list
+      stopTimes.add(stopTime);
+    }
+
+    // Create new trip times
+    final RealTimeTripTimesBuilder builder = TripTimesFactory.tripTimes(
+      trip,
+      stopTimes,
+      deduplicator
+    ).createRealTimeFromScheduledTimes();
+
+    // Update all times to mark trip times as realtime
+    for (int stopIndex = 0; stopIndex < builder.numberOfStops(); stopIndex++) {
+      final var stopAndStopTimeUpdate = stopAndStopTimeUpdates.get(stopIndex);
+
+      if (stopAndStopTimeUpdate.stopTimeUpdate().isSkipped()) {
+        builder.withCanceled(stopIndex);
+      }
+      if (stopAndStopTimeUpdate.extraCall()) {
+        builder.withExtraCall(stopIndex, true);
+      }
+
+      setArrivalAndDeparture(
+        builder,
+        stopIndex,
+        stopAndStopTimeUpdate.stopTimeUpdate(),
+        midnightSecondsSinceEpoch
+      );
+      if (builder.getArrivalTime(stopIndex) == null) {
+        builder.withArrivalDelay(stopIndex, 0);
+      }
+      if (builder.getDepartureTime(stopIndex) == null) {
+        builder.withDepartureDelay(stopIndex, 0);
+      }
+    }
+
+    // Set service code of new trip times
+    builder.withServiceCode(serviceCode);
+    if (added) {
+      builder.withAdded();
+    }
+    if (tripPatternModified) {
+      builder.withModifiedTripPattern();
+    }
+
+    tripUpdate.tripHeadsign().ifPresent(builder::withTripHeadsign);
+    tripUpdate.wheelchairAccessibility().ifPresent(builder::withWheelchairAccessibility);
+    tripUpdate.vehicleId().ifPresent(builder::withVehicleId);
+
+    RealTimeTripTimes tripTimes = builder.build();
+
+    // Add new trip times to the buffer
+    return new TripTimesWithStopPattern(tripTimes, new StopPattern(stopTimes));
+  }
+
+  /**
+   * Flag the stops of a replacement trip that are not part of the scheduled trip it replaces as
+   * extra calls, using {@link StopListDiff}. The result contains exactly the stops sent by the
+   * producer, in the same order: scheduled stops left out of the replacement are not added. A stop
+   * the producer sends as {@code SKIPPED} is canceled as usual.
+   * <p>
+   * The stops are returned unchanged if there is no scheduled pattern or the trip is not in its
+   * scheduled timetable (e.g. it was itself added in real time).
+   */
+  List<StopAndStopTimeUpdate> flagAddedStops(
+    Trip trip,
+    LocalDate serviceDate,
+    List<StopAndStopTimeUpdate> replacement,
+    @Nullable TripPattern scheduledPattern
+  ) {
+    if (scheduledPattern == null) {
+      return replacement;
+    }
+    var scheduledTripTimes = scheduledPattern.getScheduledTimetable().getTripTimes(trip);
+    if (scheduledTripTimes == null) {
+      return replacement;
+    }
+
+    final long midnightSecondsSinceEpoch = ServiceDateUtils.asStartOfService(
+      serviceDate,
+      timeZone
+    ).toEpochSecond();
+    var diff = StopListDiff.diff(
+      scheduledComparands(scheduledPattern, scheduledTripTimes, midnightSecondsSinceEpoch),
+      replacementComparands(replacement)
+    );
+
+    var result = new ArrayList<StopAndStopTimeUpdate>(replacement.size());
+    for (var entry : diff) {
+      switch (entry) {
+        case StopListDiffEntry.Kept kept -> result.add(replacement.get(kept.replacementIndex()));
+        case StopListDiffEntry.Added added -> {
+          var it = replacement.get(added.replacementIndex());
+          result.add(new StopAndStopTimeUpdate(it.stop(), it.stopTimeUpdate(), true));
+        }
+        case StopListDiffEntry.Removed _ -> {
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * The stops of the scheduled trip, with their scheduled arrival and departure times converted to
+   * seconds since the epoch so they can be compared with the GTFS-RT times of the replacement.
+   */
+  private static List<StopListDiffComparand> scheduledComparands(
+    TripPattern pattern,
+    TripTimes<?> tripTimes,
+    long midnightSecondsSinceEpoch
+  ) {
+    var comparands = new ArrayList<StopListDiffComparand>(pattern.numberOfStops());
+    for (int i = 0; i < pattern.numberOfStops(); i++) {
+      comparands.add(
+        new StopListDiffComparand(
+          pattern.getStop(i),
+          OptionalLong.of(midnightSecondsSinceEpoch + tripTimes.getScheduledArrivalTime(i)),
+          OptionalLong.of(midnightSecondsSinceEpoch + tripTimes.getScheduledDepartureTime(i))
+        )
+      );
+    }
+    return comparands;
+  }
+
+  /**
+   * The stops of the replacement trip, with their scheduled arrival and departure times. Each time
+   * is the scheduled time, or the real-time time if no scheduled time is given, and is empty if the
+   * stop has no such event (e.g. a skipped stop).
+   */
+  private static List<StopListDiffComparand> replacementComparands(
+    List<StopAndStopTimeUpdate> replacement
+  ) {
+    var comparands = new ArrayList<StopListDiffComparand>(replacement.size());
+    for (var it : replacement) {
+      var update = it.stopTimeUpdate();
+      comparands.add(
+        new StopListDiffComparand(
+          it.stop(),
+          update.scheduledArrivalTimeWithRealTimeFallback(),
+          update.scheduledDepartureTimeWithRealTimeFallback()
+        )
+      );
+    }
+    return comparands;
+  }
+
+  private static void setArrivalAndDeparture(
+    RealTimeTripTimesBuilder builder,
+    int stopPositionInPattern,
+    StopTimeUpdate update,
+    long midnightSecondsSinceEpoch
+  ) {
+    var arrivalTime = update.arrivalTime();
+    var departureTime = update.departureTime();
+    var arrivalDelay = update.arrivalDelay();
+    var departureDelay = update.departureDelay();
+    arrivalTime.ifPresentOrElse(
+      time ->
+        builder.withArrivalTime(stopPositionInPattern, (int) (time - midnightSecondsSinceEpoch)),
+      () -> arrivalDelay.ifPresent(delay -> builder.withArrivalDelay(stopPositionInPattern, delay))
+    );
+    departureTime.ifPresentOrElse(
+      time ->
+        builder.withDepartureTime(stopPositionInPattern, (int) (time - midnightSecondsSinceEpoch)),
+      () ->
+        departureDelay.ifPresent(delay -> builder.withDepartureDelay(stopPositionInPattern, delay))
+    );
+  }
+}

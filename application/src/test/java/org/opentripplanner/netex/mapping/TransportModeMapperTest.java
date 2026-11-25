@@ -1,0 +1,200 @@
+package org.opentripplanner.netex.mapping;
+
+import static java.util.Map.entry;
+import static org.entur.netex2.model.WaterSubmodeEnumeration.HIGH_SPEED_VEHICLE_SERVICE;
+import static org.entur.netex2.model.WaterSubmodeEnumeration.LOCAL_CAR_FERRY;
+import static org.entur.netex2.model.WaterSubmodeEnumeration.NATIONAL_CAR_FERRY;
+import static org.entur.netex2.model.WaterSubmodeEnumeration.POST_BOAT;
+import static org.entur.netex2.model.WaterSubmodeEnumeration.REGIONAL_CAR_FERRY;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.opentripplanner.transit.model.network.CarAccess.ALLOWED;
+import static org.opentripplanner.transit.model.network.CarAccess.NOT_ALLOWED;
+
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import org.entur.netex2.model.AirSubmodeEnumeration;
+import org.entur.netex2.model.AllPublicTransportModesEnumeration;
+import org.entur.netex2.model.BusSubmodeEnumeration;
+import org.entur.netex2.model.CoachSubmodeEnumeration;
+import org.entur.netex2.model.FunicularSubmodeEnumeration;
+import org.entur.netex2.model.MetroSubmodeEnumeration;
+import org.entur.netex2.model.RailSubmodeEnumeration;
+import org.entur.netex2.model.SnowAndIceSubmodeEnumeration;
+import org.entur.netex2.model.TaxiSubmodeEnumeration;
+import org.entur.netex2.model.TelecabinSubmodeEnumeration;
+import org.entur.netex2.model.TramSubmodeEnumeration;
+import org.entur.netex2.model.TransportSubmodeStructure;
+import org.entur.netex2.model.WaterSubmodeEnumeration;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.opentripplanner.netex.mapping.TransportModeMapper.UnsupportedModeException;
+import org.opentripplanner.transit.model.basic.SubMode;
+import org.opentripplanner.transit.model.basic.TransitMode;
+
+class TransportModeMapperTest {
+
+  private static final Map<
+    AllPublicTransportModesEnumeration,
+    TransportSubmodeStructure
+  > VALID_SUBMODE_STRUCTURES = Map.ofEntries(
+    entry(
+      AllPublicTransportModesEnumeration.AIR,
+      new TransportSubmodeStructure().withAirSubmode(AirSubmodeEnumeration.DOMESTIC_FLIGHT)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.BUS,
+      new TransportSubmodeStructure().withBusSubmode(BusSubmodeEnumeration.LOCAL_BUS)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.CABLEWAY,
+      new TransportSubmodeStructure().withTelecabinSubmode(TelecabinSubmodeEnumeration.TELECABIN)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.COACH,
+      new TransportSubmodeStructure().withCoachSubmode(CoachSubmodeEnumeration.NATIONAL_COACH)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.FUNICULAR,
+      new TransportSubmodeStructure().withFunicularSubmode(FunicularSubmodeEnumeration.FUNICULAR)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.METRO,
+      new TransportSubmodeStructure().withMetroSubmode(MetroSubmodeEnumeration.METRO)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.RAIL,
+      new TransportSubmodeStructure().withRailSubmode(RailSubmodeEnumeration.LONG_DISTANCE)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.SNOW_AND_ICE,
+      new TransportSubmodeStructure().withSnowAndIceSubmode(SnowAndIceSubmodeEnumeration.SNOW_COACH)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.TAXI,
+      new TransportSubmodeStructure().withTaxiSubmode(TaxiSubmodeEnumeration.COMMUNAL_TAXI)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.TRAM,
+      new TransportSubmodeStructure().withTramSubmode(TramSubmodeEnumeration.CITY_TRAM)
+    ),
+    entry(
+      AllPublicTransportModesEnumeration.WATER,
+      new TransportSubmodeStructure().withWaterSubmode(
+        WaterSubmodeEnumeration.INTERNATIONAL_PASSENGER_FERRY
+      )
+    )
+  );
+
+  private static final EnumSet<AllPublicTransportModesEnumeration> SUPPORTED_MODES = EnumSet.copyOf(
+    VALID_SUBMODE_STRUCTURES.keySet()
+  );
+
+  private final TransportModeMapper transportModeMapper = new TransportModeMapper();
+
+  @Test
+  void mapWithTransportModeOnly() throws UnsupportedModeException {
+    var transitMode = transportModeMapper.map(AllPublicTransportModesEnumeration.BUS, null);
+    assertEquals(TransitMode.BUS, transitMode.mainMode());
+    assertNull(transitMode.subMode());
+  }
+
+  @Test
+  void mapCableway() throws UnsupportedModeException {
+    var transitMode = transportModeMapper.map(AllPublicTransportModesEnumeration.CABLEWAY, null);
+    assertEquals(TransitMode.GONDOLA, transitMode.mainMode());
+    assertNull(transitMode.subMode());
+  }
+
+  @Test
+  void mapWithSubMode() throws UnsupportedModeException {
+    var transitMode = transportModeMapper.map(
+      AllPublicTransportModesEnumeration.RAIL,
+      VALID_SUBMODE_STRUCTURES.get(AllPublicTransportModesEnumeration.RAIL)
+    );
+    assertEquals(TransitMode.RAIL, transitMode.mainMode());
+    assertEquals("longDistance", transitMode.subMode());
+  }
+
+  @ParameterizedTest(name = "[{index}] {0}")
+  @MethodSource("createSubModeTestCases")
+  void acceptAllValidSubModes(
+    AllPublicTransportModesEnumeration mode,
+    TransportSubmodeStructure submodeStructure
+  ) throws UnsupportedModeException {
+    assertNotNull(transportModeMapper.map(mode, submodeStructure));
+  }
+
+  @Test
+  void checkSubModePrecedenceOverMainMode() throws UnsupportedModeException {
+    var transitMode = transportModeMapper.map(
+      AllPublicTransportModesEnumeration.BUS,
+      new TransportSubmodeStructure().withWaterSubmode(
+        WaterSubmodeEnumeration.INTERNATIONAL_PASSENGER_FERRY
+      )
+    );
+    assertEquals(TransitMode.FERRY, transitMode.mainMode());
+    assertEquals("internationalPassengerFerry", transitMode.subMode());
+  }
+
+  @Test
+  void supportedMode() {
+    SUPPORTED_MODES.forEach(mode -> {
+      try {
+        transportModeMapper.map(mode, null);
+      } catch (UnsupportedModeException e) {
+        fail("Mode " + mode + " should be supported", e);
+      }
+    });
+  }
+
+  @Test
+  void unsupportedMode() {
+    EnumSet.complementOf(SUPPORTED_MODES).forEach(mode -> {
+      assertThrows(UnsupportedModeException.class, () -> transportModeMapper.map(mode, null));
+    });
+
+    assertThrows(UnsupportedModeException.class, () -> transportModeMapper.map(null, null));
+  }
+
+  @Test
+  void carsAllowedBasedOnSubMode() {
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(SubMode.of("nationalCarFerry")));
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(SubMode.of("regionalCarFerry")));
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(SubMode.of("localCarFerry")));
+    assertEquals(
+      ALLOWED,
+      transportModeMapper.mapCarsAllowed(SubMode.of("highSpeedVehicleService"))
+    );
+    assertEquals(NOT_ALLOWED, transportModeMapper.mapCarsAllowed(SubMode.UNKNOWN));
+    assertEquals(NOT_ALLOWED, transportModeMapper.mapCarsAllowed((SubMode) null));
+  }
+
+  @Test
+  void carsAllowedBasedOn() {
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(tsm(NATIONAL_CAR_FERRY)));
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(tsm(REGIONAL_CAR_FERRY)));
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(tsm(LOCAL_CAR_FERRY)));
+    assertEquals(ALLOWED, transportModeMapper.mapCarsAllowed(tsm(HIGH_SPEED_VEHICLE_SERVICE)));
+    assertEquals(NOT_ALLOWED, transportModeMapper.mapCarsAllowed(tsm(POST_BOAT)));
+    assertEquals(NOT_ALLOWED, transportModeMapper.mapCarsAllowed(tsm(null)));
+    assertEquals(NOT_ALLOWED, transportModeMapper.mapCarsAllowed((TransportSubmodeStructure) null));
+  }
+
+  private static List<Arguments> createSubModeTestCases() {
+    return VALID_SUBMODE_STRUCTURES.entrySet()
+      .stream()
+      .map(entry -> Arguments.of(entry.getKey(), entry.getValue()))
+      .toList();
+  }
+
+  private static TransportSubmodeStructure tsm(WaterSubmodeEnumeration waterSubMode) {
+    return new TransportSubmodeStructure().withWaterSubmode(waterSubMode);
+  }
+}

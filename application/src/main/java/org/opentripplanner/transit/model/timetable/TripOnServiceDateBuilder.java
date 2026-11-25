@@ -1,0 +1,92 @@
+package org.opentripplanner.transit.model.timetable;
+
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
+import org.opentripplanner.core.model.id.FeedScopedId;
+import org.opentripplanner.transit.model.framework.AbstractEntityBuilder;
+
+public class TripOnServiceDateBuilder
+  extends AbstractEntityBuilder<TripOnServiceDate, TripOnServiceDateBuilder>
+{
+
+  private Trip trip;
+  private LocalDate serviceDate;
+  private TripAlteration tripAlteration;
+  private boolean realtimeExtraJourney;
+  private List<TripOnServiceDate> replacementFor = List.of();
+  private VehicleAssignment vehicleAssignment;
+
+  TripOnServiceDateBuilder(FeedScopedId id) {
+    super(id);
+  }
+
+  TripOnServiceDateBuilder(TripOnServiceDate original) {
+    super(original);
+    this.trip = original.getTrip();
+    this.serviceDate = original.getServiceDate();
+    this.tripAlteration = original.getTripAlteration();
+    this.realtimeExtraJourney = original.isRealtimeExtraJourney();
+    this.replacementFor = new ArrayList<>(original.getReplacementFor());
+    this.vehicleAssignment = original.getVehicleAssignment();
+  }
+
+  public TripOnServiceDateBuilder withTrip(Trip trip) {
+    this.trip = trip;
+    return this;
+  }
+
+  public TripOnServiceDateBuilder withServiceDate(LocalDate serviceDate) {
+    this.serviceDate = serviceDate;
+    return this;
+  }
+
+  public TripOnServiceDateBuilder withTripAlteration(TripAlteration tripAlteration) {
+    this.tripAlteration = tripAlteration;
+    return this;
+  }
+
+  public TripOnServiceDateBuilder withRealtimeExtraJourney(boolean realtimeExtraJourney) {
+    this.realtimeExtraJourney = realtimeExtraJourney;
+    return this;
+  }
+
+  public TripOnServiceDateBuilder withReplacementFor(List<TripOnServiceDate> replacementFor) {
+    this.replacementFor = replacementFor;
+    return this;
+  }
+
+  public TripOnServiceDateBuilder withVehicleAssignment(VehicleAssignment vehicleAssignment) {
+    this.vehicleAssignment = vehicleAssignment;
+    return this;
+  }
+
+  public Trip getTrip() {
+    return trip;
+  }
+
+  public LocalDate getServiceDate() {
+    return serviceDate;
+  }
+
+  public TripAlteration getTripAlteration() {
+    return tripAlteration;
+  }
+
+  boolean isRealtimeExtraJourney() {
+    return realtimeExtraJourney;
+  }
+
+  public List<TripOnServiceDate> getReplacementFor() {
+    return replacementFor;
+  }
+
+  public VehicleAssignment getVehicleAssignment() {
+    return vehicleAssignment;
+  }
+
+  @Override
+  protected TripOnServiceDate buildFromValues() {
+    return new TripOnServiceDate(this);
+  }
+}

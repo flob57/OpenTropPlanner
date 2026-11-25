@@ -1,0 +1,230 @@
+package org.opentripplanner.routing.service;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import java.util.List;
+import org.jspecify.annotations.Nullable;
+import org.opentripplanner.ext.carpooling.CarpoolingService;
+import org.opentripplanner.ext.dataoverlay.configuration.DataOverlayParameterBindings;
+import org.opentripplanner.ext.flex.FlexParameters;
+import org.opentripplanner.ext.realtimeresolver.RealtimeResolver;
+import org.opentripplanner.ext.ridehailing.RideHailingService;
+import org.opentripplanner.ext.sorlandsbanen.SorlandsbanenNorwayService;
+import org.opentripplanner.ext.stopconsolidation.StopConsolidationService;
+import org.opentripplanner.ext.taxi.TaxiService;
+import org.opentripplanner.framework.application.OTPRequestTimeoutException;
+import org.opentripplanner.framework.time.ZoneIdFallback;
+import org.opentripplanner.model.plan.Itinerary;
+import org.opentripplanner.place.api.NearbyStop;
+import org.opentripplanner.raptor.RaptorServiceFactory;
+import org.opentripplanner.raptor.api.request.RaptorTuningParameters;
+import org.opentripplanner.routing.algorithm.RequestPreProcessor;
+import org.opentripplanner.routing.algorithm.RoutingWorker;
+import org.opentripplanner.routing.algorithm.RoutingWorkerRequest;
+import org.opentripplanner.routing.algorithm.filterchain.framework.spi.ItineraryDecorator;
+import org.opentripplanner.routing.algorithm.raptoradapter.transit.TransitTuningParameters;
+import org.opentripplanner.routing.algorithm.raptoradapter.transit.TripSchedule;
+import org.opentripplanner.routing.algorithm.via.ViaRoutingWorker;
+import org.opentripplanner.routing.api.RoutingService;
+import org.opentripplanner.routing.api.request.RouteRequest;
+import org.opentripplanner.routing.api.request.RouteViaRequest;
+import org.opentripplanner.routing.api.response.RoutingResponse;
+import org.opentripplanner.routing.api.response.ViaRoutingResponse;
+import org.opentripplanner.routing.linking.LinkingContextFactory;
+import org.opentripplanner.routing.services.TransitAlertService;
+import org.opentripplanner.routing.via.ViaCoordinateTransferFactory;
+import org.opentripplanner.service.streetdetails.StreetDetailsService;
+import org.opentripplanner.service.vehiclerental.VehicleRentalService;
+import org.opentripplanner.street.graph.Graph;
+import org.opentripplanner.street.service.StreetLimitationParametersService;
+import org.opentripplanner.transfer.regular.FlexTransferService;
+import org.opentripplanner.transit.service.TransitService;
+import org.opentripplanner.transit.transfer.regular.RegularTransferRepositorySnapshot;
+import org.opentripplanner.utils.tostring.MultiLineToStringBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+// TODO VIA: 2022-08-29 javadocs
+
+/**
+ * Entry point for requests towards the routing API.
+ */
+public class DefaultRoutingService implements RoutingService {
+
+  private static final Logger LOG = LoggerFactory.getLogger(DefaultRoutingService.class);
+
+  private final TransitService transitService;
+  private final TransitAlertService transitAlertService;
+  private final Graph graph;
+  private final RaptorServiceFactory<TripSchedule> raptorServiceFactory;
+  private final MeterRegistry meterRegistry;
+  private final StreetLimitationParametersService streetLimitationParametersService;
+  private final VehicleRentalService vehicleRentalService;
+  private final StreetDetailsService streetDetailsService;
+  private final FlexTransferService transferService;
+  private final RegularTransferRepositorySnapshot<NearbyStop, RouteRequest> regularTransfers;
+  private final FlexParameters flexParameters;
+  private final List<RideHailingService> rideHailingServices;
+  private final ViaCoordinateTransferFactory viaTransferResolver;
+  private final LinkingContextFactory linkingContextFactory;
+  private final TransitTuningParameters transitTuningParameters;
+  private final RaptorTuningParameters raptorTuningParameters;
+
+  @Nullable
+  private final RealtimeResolver realtimeResolver;
+
+  //private final TransitRoutingConfig transitRoutingConfig;
+
+  @Nullable
+  private final DataOverlayParameterBindings dataOverlayParameterBindings;
+
+  @Nullable
+  private final SorlandsbanenNorwayService sorlandsbanenService;
+
+  @Nullable
+  private final CarpoolingService carpoolingService;
+
+  @Nullable
+  private final TaxiService taxiService;
+
+  @Nullable
+  private final ItineraryDecorator emissionItineraryDecorator;
+
+  @Nullable
+  private final StopConsolidationService stopConsolidationService;
+
+  private final RequestPreProcessor requestPreProcessor;
+
+  public DefaultRoutingService(
+    TransitService transitService,
+    Graph graph,
+    RaptorServiceFactory<TripSchedule> raptorServiceFactory,
+    MeterRegistry meterRegistry,
+    StreetLimitationParametersService streetLimitationParametersService,
+    VehicleRentalService vehicleRentalService,
+    StreetDetailsService streetDetailsService,
+    FlexTransferService transferService,
+    RegularTransferRepositorySnapshot<NearbyStop, RouteRequest> regularTransfers,
+    TransitAlertService transitAlertService,
+    FlexParameters flexParameters,
+    List<RideHailingService> rideHailingServices,
+    @Nullable DataOverlayParameterBindings dataOverlayParameterBindings,
+    @Nullable SorlandsbanenNorwayService sorlandsbanenService,
+    ViaCoordinateTransferFactory viaTransferResolver,
+    @Nullable CarpoolingService carpoolingService,
+    @Nullable TaxiService taxiService,
+    @Nullable ItineraryDecorator emissionItineraryDecorator,
+    @Nullable StopConsolidationService stopConsolidationService,
+    LinkingContextFactory linkingContextFactory,
+    TransitTuningParameters transitTuningParameters,
+    RaptorTuningParameters raptorTuningParameters,
+    @Nullable RealtimeResolver realtimeResolver
+  ) {
+    this.transitService = transitService;
+    this.transitAlertService = transitAlertService;
+    this.graph = graph;
+    this.raptorServiceFactory = raptorServiceFactory;
+    this.meterRegistry = meterRegistry;
+    this.streetLimitationParametersService = streetLimitationParametersService;
+    this.vehicleRentalService = vehicleRentalService;
+    this.streetDetailsService = streetDetailsService;
+    this.transferService = transferService;
+    this.regularTransfers = regularTransfers;
+    this.flexParameters = flexParameters;
+    this.rideHailingServices = rideHailingServices;
+    this.dataOverlayParameterBindings = dataOverlayParameterBindings;
+    this.sorlandsbanenService = sorlandsbanenService;
+    this.viaTransferResolver = viaTransferResolver;
+    this.carpoolingService = carpoolingService;
+    this.taxiService = taxiService;
+    this.emissionItineraryDecorator = emissionItineraryDecorator;
+    this.stopConsolidationService = stopConsolidationService;
+    this.linkingContextFactory = linkingContextFactory;
+    this.transitTuningParameters = transitTuningParameters;
+    this.raptorTuningParameters = raptorTuningParameters;
+    this.realtimeResolver = realtimeResolver;
+
+    var timeZone = ZoneIdFallback.zoneId(transitService.getTimeZone());
+
+    this.requestPreProcessor = new RequestPreProcessor(
+      transitService,
+      raptorTuningParameters,
+      timeZone
+    );
+  }
+
+  @Override
+  public RoutingResponse route(RouteRequest request) {
+    LOG.debug("Request: {}", request);
+    OTPRequestTimeoutException.checkForTimeout();
+    request.validateOriginAndDestination();
+    var worker = newRoutingWorker(mapRequest(request));
+    var response = worker.route();
+    logResponse(response);
+    return response;
+  }
+
+  @Override
+  public ViaRoutingResponse route(RouteViaRequest request) {
+    LOG.debug("Request: {}", request);
+    OTPRequestTimeoutException.checkForTimeout();
+    var viaRoutingWorker = new ViaRoutingWorker(request, req ->
+      newRoutingWorker(mapRequest(req)).route()
+    );
+    // TODO: Add output logging here, see route(..) method
+    return viaRoutingWorker.route();
+  }
+
+  private RoutingWorker newRoutingWorker(RoutingWorkerRequest workerRequest) {
+    return new RoutingWorker(
+      transitService,
+      transitAlertService,
+      graph,
+      raptorServiceFactory,
+      meterRegistry,
+      streetLimitationParametersService,
+      vehicleRentalService,
+      streetDetailsService,
+      transferService,
+      regularTransfers,
+      flexParameters,
+      rideHailingServices,
+      dataOverlayParameterBindings,
+      sorlandsbanenService,
+      viaTransferResolver,
+      carpoolingService,
+      taxiService,
+      emissionItineraryDecorator,
+      stopConsolidationService,
+      linkingContextFactory,
+      transitTuningParameters,
+      raptorTuningParameters,
+      workerRequest,
+      realtimeResolver
+    );
+  }
+
+  private RoutingWorkerRequest mapRequest(RouteRequest request) {
+    return requestPreProcessor.computeRequest(request);
+  }
+
+  private void logResponse(RoutingResponse response) {
+    if (response.getTripPlan().itineraries.isEmpty() && response.getRoutingErrors().isEmpty()) {
+      // We should provide an error if there is no results, this is important for the client so
+      // it knows if it can page or abort.
+      LOG.warn("The routing result is empty, but there is no errors...");
+    }
+
+    if (LOG.isDebugEnabled()) {
+      var text = MultiLineToStringBuilder.of("Response")
+        .add("NextPage", response.getNextPageCursor())
+        .add("PreviousPage", response.getPreviousPageCursor())
+        .addColNl(
+          "Itineraries",
+          response.getTripPlan().itineraries.stream().map(Itinerary::toStr).toList()
+        )
+        .addColNl("Errors", response.getRoutingErrors())
+        .toString();
+      LOG.debug(text);
+    }
+  }
+}

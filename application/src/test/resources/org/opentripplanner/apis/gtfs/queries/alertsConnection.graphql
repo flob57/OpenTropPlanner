@@ -1,0 +1,22 @@
+{
+  alertsConnection(first: 2) {
+    totalCount
+    pageInfo {
+      hasNextPage
+      hasPreviousPage
+    }
+    edges {
+      node {
+        id
+        alertId
+        version
+        headerDefault: alertHeaderText
+        headerDe: alertHeaderText(language: "de")
+        descriptionDefault: alertDescriptionText
+        descriptionDe: alertDescriptionText(language: "de")
+        urlDefault: alertUrl
+        urlDe: alertUrl(language: "de")
+      }
+    }
+  }
+}
